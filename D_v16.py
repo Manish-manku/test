@@ -853,21 +853,43 @@ class RandomnessExtractor:
         seed_bytes = np.packbits(seed[:min(len(seed), 2048)]).tobytes()
 
         output_accum = np.zeros(m, dtype=np.uint8)
-        chunk_nonce   = 0
+        chunk_nonce = 0
+
+        chunk_inputs: List[np.ndarray] = []
+        chunk_lengths: List[int] = []
+        chunk_max_out: List[int] = []
+        chunk_segments: List[List[np.ndarray]] = []
+        chunk_bits_produced: List[int] = []
 
         for i in range(n_chunks):
             i_start = i * n_c
-            i_end   = min(i_start + n_c, n)
-            chunk   = weak_random[i_start:i_end]
-            nc_i    = len(chunk)
+            i_end = min(i_start + n_c, n)
+            chunk = weak_random[i_start:i_end]
+            nc_i = len(chunk)
             if nc_i == 0:
                 continue
 
-            max_mc_i = max(max_raw_size - nc_i, 1)
-            per_chunk_segments: List[np.ndarray] = []
-            chunk_bits_produced = 0
-            while chunk_bits_produced < m:
-                remaining_for_chunk = m - chunk_bits_produced
+            chunk_inputs.append(chunk)
+            chunk_lengths.append(nc_i)
+            chunk_max_out.append(max(max_raw_size - nc_i, 1))
+            chunk_segments.append([])
+            chunk_bits_produced.append(0)
+
+        if not chunk_inputs:
+            raise ExtractionFailureError(
+                f"toeplitz_extract: no non-empty chunks available for extraction. n={n}, m={m}."
+            )
+
+        while any(bits < m for bits in chunk_bits_produced):
+            made_progress = False
+            for idx, (chunk, nc_i, max_mc_i) in enumerate(
+                zip(chunk_inputs, chunk_lengths, chunk_max_out)
+            ):
+                produced = chunk_bits_produced[idx]
+                if produced >= m:
+                    continue
+
+                remaining_for_chunk = m - produced
                 mc_i = min(remaining_for_chunk, max_mc_i)
                 if mc_i <= 0:
                     raise ExtractionFailureError(
@@ -887,22 +909,30 @@ class RandomnessExtractor:
                         f"chunk_nonce={chunk_nonce}."
                     ) from exc
 
-                per_chunk_segments.append(out_chunk)
-                chunk_bits_produced += len(out_chunk)
+                chunk_segments[idx].append(out_chunk)
+                chunk_bits_produced[idx] += len(out_chunk)
                 chunk_nonce += 1
+                made_progress = True
 
+            if not made_progress:
+                raise ExtractionFailureError(
+                    f"toeplitz_extract: chunked extraction stalled. n={n}, m={m}, "
+                    f"n_chunks={n_chunks}, produced={chunk_bits_produced}."
+                )
+
+        for idx, per_chunk_segments in enumerate(chunk_segments):
             if not per_chunk_segments:
                 raise ExtractionFailureError(
-                    f"toeplitz_extract: chunk {i} produced no output. "
-                    f"n={n}, m={m}, n_chunks={n_chunks}, nc_i={nc_i}."
+                    f"toeplitz_extract: chunk {idx} produced no output. "
+                    f"n={n}, m={m}, n_chunks={n_chunks}, nc_i={chunk_lengths[idx]}."
                 )
 
             chunk_result = np.concatenate(per_chunk_segments)
             if len(chunk_result) < m:
                 raise ExtractionFailureError(
-                    f"toeplitz_extract: chunk {i} produced {len(chunk_result)} bits "
+                    f"toeplitz_extract: chunk {idx} produced {len(chunk_result)} bits "
                     f"but {m} were required for accumulation. "
-                    f"n={n}, m={m}, n_chunks={n_chunks}, nc_i={nc_i}."
+                    f"n={n}, m={m}, n_chunks={n_chunks}, nc_i={chunk_lengths[idx]}."
                 )
 
             output_accum ^= chunk_result[:m].astype(np.uint8, copy=False)

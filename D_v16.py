@@ -799,7 +799,12 @@ class RandomnessExtractor:
 
         raw_size  = m + n
         circ_size = 1 << int(np.ceil(np.log2(max(raw_size, 2))))
-        circ_size = min(circ_size, self._MAX_CIRC_SIZE)
+        if circ_size > self._MAX_CIRC_SIZE:
+            raise ExtractionFailureError(
+                f"_toeplitz_fft_chunk: FFT size {circ_size} exceeds "
+                f"MAX_CIRC_SIZE={self._MAX_CIRC_SIZE}. "
+                "Use smaller chunks or reduce output_length."
+            )
 
         circ_col = np.zeros(circ_size, dtype=np.float32)
         circ_col[:m] = col
@@ -828,6 +833,11 @@ class RandomnessExtractor:
         n = len(weak_random)
         m = self.output_length
 
+        if n <= 0 or m <= 0:
+            raise ExtractionFailureError(
+                f"toeplitz_extract: invalid dimensions n={n}, m={m}."
+            )
+
         single_circ = 1 << int(np.ceil(np.log2(max(m + n, 2))))
         if single_circ <= self._MAX_CIRC_SIZE:
             required = n + m - 1
@@ -835,16 +845,16 @@ class RandomnessExtractor:
                 seed = self._extend_seed(seed, required)
             return self._toeplitz_fft_chunk(weak_random, seed, m)
 
-        MAX_CHUNK_INPUT = max(self._MAX_CIRC_SIZE // 4, 1024)
-
-        n_chunks  = int(np.ceil(n / MAX_CHUNK_INPUT))
-        n_c       = int(np.ceil(n / n_chunks))
-        m_c_base  = m // n_chunks
+        max_raw_size   = max(self._MAX_CIRC_SIZE // 2, 2)
+        max_chunk_in   = max(max_raw_size // 2, 1024)
+        n_chunks       = max(int(np.ceil(n / max_chunk_in)), 1)
+        n_c            = int(np.ceil(n / n_chunks))
 
         seed_bytes = np.packbits(seed[:min(len(seed), 2048)]).tobytes()
 
         output_chunks: List[np.ndarray] = []
         bits_produced = 0
+        chunk_nonce   = 0
 
         for i in range(n_chunks):
             i_start = i * n_c
@@ -854,14 +864,36 @@ class RandomnessExtractor:
             if nc_i == 0:
                 continue
 
-            mc_i = (m - bits_produced) if (i == n_chunks - 1) else m_c_base
-            if mc_i <= 0:
-                break
+            max_mc_i = max(max_raw_size - nc_i, 1)
+            remaining = m - bits_produced
+            while remaining > 0:
+                mc_i = min(remaining, max_mc_i)
+                if mc_i <= 0:
+                    raise ExtractionFailureError(
+                        f"toeplitz_extract: unable to size chunk safely (nc_i={nc_i}, "
+                        f"max_raw_size={max_raw_size}, remaining={remaining})."
+                    )
 
-            chunk_seed = self._derive_chunk_seed(seed_bytes, i, nc_i + mc_i - 1)
-            out_chunk  = self._toeplitz_fft_chunk(chunk, chunk_seed, mc_i)
-            output_chunks.append(out_chunk)
-            bits_produced += len(out_chunk)
+                chunk_seed = self._derive_chunk_seed(
+                    seed_bytes, chunk_nonce, nc_i + mc_i - 1
+                )
+                try:
+                    out_chunk = self._toeplitz_fft_chunk(chunk, chunk_seed, mc_i)
+                except (MemoryError, ValueError) as exc:
+                    raise ExtractionFailureError(
+                        f"toeplitz_extract: FFT chunk failed for nc_i={nc_i}, mc_i={mc_i}, "
+                        f"chunk_nonce={chunk_nonce}."
+                    ) from exc
+
+                output_chunks.append(out_chunk)
+                bits_produced += len(out_chunk)
+                chunk_nonce += 1
+                remaining = m - bits_produced
+
+                if bits_produced >= m:
+                    break
+            if bits_produced >= m:
+                break
 
         if not output_chunks:
             raise ExtractionFailureError(
@@ -1075,6 +1107,7 @@ class CertifiedGenerationSession:
         metadata_list: List[Dict]       = []
 
         block_size = self.te_qrng.block_size
+        convergence_warning: Optional[str] = None
 
         while True:
             raw_bits, bases, raw_signal = source_simulator.generate_block(block_size)
@@ -1116,11 +1149,12 @@ class CertifiedGenerationSession:
 
             total_gen = sum(len(g) for g in all_gen_bits)
             if total_gen > 50 * n_bits:
-                raise EATConvergenceWarning(
-                    f"CertifiedGenerationSession.run: EAT bound not reached after "
+                convergence_warning = (
+                    "CertifiedGenerationSession.run: EAT bound not reached after "
                     f"total_gen={total_gen} bits ({50 * n_bits} limit). "
-                    f"Source entropy too low for requested n_bits={n_bits}."
+                    f"Proceeding with partial certified output for requested n_bits={n_bits}."
                 )
+                break
 
         # Global final Toeplitz extraction
         all_gen_concat = (np.concatenate(all_gen_bits)
@@ -1132,6 +1166,26 @@ class CertifiedGenerationSession:
         output_length    = min(n_bits, certified_output)
 
         if output_length < 1 or len(all_gen_concat) < 2:
+            if convergence_warning is not None:
+                n_total_convergence = sum(session.block_n_gen_history)
+                eat_summary: EATSummary = {
+                    'certified_quantity':    'H_min(X|E)',
+                    'security_definition':   'Trace-distance ε-security',
+                    'epsilon_total':         self.te_qrng.epsilon_total,
+                    'epsilon_eat':           self.epsilon_eat,
+                    'epsilon_smooth':        self.te_qrng.epsilon_smooth,
+                    'epsilon_ext':           self.epsilon_ext,
+                    'blocks_used':           len(session.block_entropy_history),
+                    'h_total_eat':           h_total,
+                    'certified_output_bits': certified_output,
+                    'actual_output_bits':    0,
+                    'delta_eat':             (2.0 * np.sqrt(n_total_convergence) *
+                                              np.sqrt(np.log(1.0 / self.epsilon_eat))
+                                              if len(session.block_entropy_history) > 0 else 0.0),
+                    'sum_f_ei':              sum(session.block_entropy_history),
+                }
+                metadata_list.append(eat_summary)
+                return np.array([], dtype=np.uint8), metadata_list
             raise InsufficientEntropyError(
                 f"CertifiedGenerationSession.run: certified output length is "
                 f"{output_length} bits after EAT accumulation. "

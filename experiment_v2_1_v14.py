@@ -47,7 +47,15 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
 
 # Import v16 core (A5 fixed: QRNGSessionState + CertifiedGenerationSession)
-from D_v16 import TrustEnhancedQRNG, TrustVector, QRNGSessionState, EATConvergenceWarning, InsufficientEntropyError
+from D_v16 import (
+    TrustEnhancedQRNG,
+    TrustVector,
+    QRNGSessionState,
+    EATConvergenceWarning,
+    InsufficientEntropyError,
+    BlockMetadata,
+    EATSummary,
+)
 
 from New_simulator_v9 import (
     QuantumSourceSimulator,
@@ -185,18 +193,24 @@ def _run_exp2_scenario(args) -> Tuple[str, Dict]:
     else:
         empirical_h = 0.0
 
-    final_summary        = metadata_list[-1]
-    h_total_eat          = final_summary.get('h_total_eat', 0.0)
-    certified_output_bits = final_summary.get('certified_output_bits', len(output_bits))
-    delta_eat            = final_summary.get('delta_eat', 0.0)
-    blocks_used          = final_summary.get('blocks_used', max(len(metadata_list) - 1, 0))
-    sum_f_ei             = final_summary.get('sum_f_ei', 0.0)
+    final_summary = metadata_list[-1]
+    if not isinstance(final_summary, dict):
+        raise RuntimeError("Invalid metadata summary type.")
+    summary_typed: EATSummary = final_summary
+    h_total_eat           = summary_typed['h_total_eat']
+    certified_output_bits = summary_typed['certified_output_bits']
+    delta_eat             = summary_typed['delta_eat']
+    blocks_used           = summary_typed['blocks_used']
+    sum_f_ei              = summary_typed['sum_f_ei']
 
     h_total_progression = []
     delta_progression   = []
     for meta in metadata_list[:-1]:
-        h_total_progression.append(meta.get('h_total_eat', 0.0))
-        delta_progression.append(meta.get('delta_eat', 0.0))
+        if not isinstance(meta, dict):
+            raise RuntimeError("Invalid block metadata type.")
+        meta_typed: BlockMetadata = meta
+        h_total_progression.append(meta_typed['h_total_eat'])
+        delta_progression.append(meta_typed['delta_eat'])
 
     result = {
         'empirical_h_output':    empirical_h,
@@ -235,16 +249,18 @@ def _run_exp3_scenario(args) -> Tuple[str, List]:
         ) from exc
 
     final_summary = metadata_list[-1]
+    summary_typed: EATSummary = final_summary
 
     block_results = []
     for idx, meta in enumerate(metadata_list[:-1]):
+        meta_typed: BlockMetadata = meta
         block_results.append({
             'block':                 idx,
-            'trust_score':           meta['trust_score'],
-            'h_total_eat':           meta['h_total_eat'],
-            'delta_eat':             meta['delta_eat'],
-            'extraction_rate':       meta['extraction_rate'],
-            'certified_output_bits': final_summary.get('certified_output_bits', 0),
+            'trust_score':           meta_typed['trust_score'],
+            'h_total_eat':           meta_typed['h_total_eat'],
+            'delta_eat':             meta_typed['delta_eat'],
+            'extraction_rate':       meta_typed['extraction_rate'],
+            'certified_output_bits': summary_typed['certified_output_bits'],
         })
 
     return scenario_name, block_results
@@ -292,8 +308,8 @@ def _run_exp4_scenario(args) -> Tuple[str, Dict]:
         'te_quality_score': te_quality,
         'si_quality_score': si_quality,
         'te_avg_trust':     float(np.mean([m['trust_score'] for m in te_blocks])) if te_blocks else 0.0,
-        'te_avg_h_min_per_bit': float(np.mean([m.get('h_min_certified', 0) for m in te_blocks])) if te_blocks else 0.0,
-        'si_avg_h_min_per_bit': float(np.mean([m.get('h_min_certified', 0) for m in si_blocks])) if si_blocks else 0.0,
+        'te_avg_h_min_per_bit': float(np.mean([m['h_min_certified'] for m in te_blocks])) if te_blocks else 0.0,
+        'si_avg_h_min_per_bit': float(np.mean([m['h_min_certified'] for m in si_blocks])) if si_blocks else 0.0,
     }
     return scenario_name, result
 
@@ -329,9 +345,9 @@ def _run_exp4b_scenario(args) -> Tuple[float, Dict]:
         te_qrng = TrustEnhancedQRNG(block_size=n_bits)
         try:
             _, te_meta = te_qrng.process_block(block.bits, block.bases, block.raw_signal)
-            te_h_min           = float(te_meta.get('h_min_certified', 0.0))
-            te_extraction_rate = float(te_meta.get('extraction_rate', 0.0))
-            te_trust_score     = float(te_meta.get('trust_score', 1.0))
+            te_h_min           = float(te_meta['h_min_certified'])
+            te_extraction_rate = float(te_meta['extraction_rate'])
+            te_trust_score     = float(te_meta['trust_score'])
         except Exception:
             te_h_min, te_extraction_rate, te_trust_score = 0.0, 0.0, 0.0
 
@@ -340,8 +356,8 @@ def _run_exp4b_scenario(args) -> Tuple[float, Dict]:
             block2  = source.generate_block(n_bits)
             si_qrng = StandardSIQRNG(block_size=n_bits)
             _, si_meta = si_qrng.process_block(block2.bits, block2.bases, block2.raw_signal)
-            si_h_min           = float(si_meta.get('h_min_certified', 0.0))
-            si_extraction_rate = float(si_meta.get('extraction_rate', 0.0))
+            si_h_min           = float(si_meta['h_min_certified'])
+            si_extraction_rate = float(si_meta['extraction_rate'])
         except Exception:
             si_h_min, si_extraction_rate = 0.0, 0.0
 
@@ -1160,7 +1176,7 @@ class ExperimentRunner:
 
             results['block'].append(block_idx)
             results['trust_score'].append(metadata['trust_score'])
-            results['h_min_certified'].append(metadata.get('h_min_certified', 0.0))
+            results['h_min_certified'].append(metadata['h_min_certified'])
             results['extraction_rate'].append(metadata['extraction_rate'])
             results['output_bits'].append(metadata['output_bits'])
             results['source_quality'].append(source_quality)

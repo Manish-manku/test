@@ -184,7 +184,12 @@ class BlockMetadata(TypedDict):
     gate_sample_warning:   Optional[str]
     gate_persistent_small_bias_flag: bool
     cumulative_gate_yield: Optional[float]
+    cumulative_epsilon_gate: Optional[float]
+    epsilon_gate_running_average: Optional[float]
     cumulative_epsilon_gate_trend: Optional[float]
+    epsilon_gate_drift_indicator: Optional[float]
+    epsilon_gate_moving_average: Optional[float]
+    weak_adversarial_influence_flag: bool
 
 
 class EATSummary(TypedDict):
@@ -971,7 +976,13 @@ class RandomnessExtractor:
 
         output_chunks: List[np.ndarray] = []
         bits_produced = 0
-        chunk_nonce   = 0
+        # Domain-separation nonce for this extraction call. Derived from master
+        # seed bytes so it remains independent from source bits while ensuring
+        # per-call seed namespace separation in chunked Toeplitz mode.
+        chunk_seed_nonce = int.from_bytes(
+            hashlib.sha256(b"toeplitz-chunk-nonce" + seed_bytes).digest()[:8],
+            "big",
+        )
 
         for i in range(n_chunks):
             i_start = i * n_c
@@ -991,20 +1002,22 @@ class RandomnessExtractor:
                         f"max_raw_size={max_raw_size}, remaining={remaining})."
                     )
 
+                # Domain-separated chunk seed:
+                #   H(master_seed || chunk_index || per-extraction nonce || counter)
+                # This enforces chunk independence in the chunked extractor path.
                 chunk_seed = self._derive_chunk_seed(
-                    seed_bytes, chunk_nonce, nc_i + mc_i - 1
+                    seed_bytes, i, chunk_seed_nonce, nc_i + mc_i - 1
                 )
                 try:
                     out_chunk = self._toeplitz_fft_chunk(chunk, chunk_seed, mc_i)
                 except (MemoryError, ValueError) as exc:
                     raise ExtractionFailureError(
                         f"toeplitz_extract: FFT chunk failed for nc_i={nc_i}, mc_i={mc_i}, "
-                        f"chunk_nonce={chunk_nonce}."
+                        f"chunk_idx={i}, chunk_seed_nonce={chunk_seed_nonce}."
                     ) from exc
 
                 output_chunks.append(out_chunk)
                 bits_produced += len(out_chunk)
-                chunk_nonce += 1
                 remaining = m - bits_produced
 
                 if bits_produced >= m:
@@ -1031,10 +1044,15 @@ class RandomnessExtractor:
         return result[:m]
 
     def _derive_chunk_seed(self, master_seed_bytes: bytes,
-                            chunk_idx: int, length: int) -> np.ndarray:
+                            chunk_idx: int, nonce: int, length: int) -> np.ndarray:
         extended: List[int] = []
         counter = 0
-        prefix  = master_seed_bytes + chunk_idx.to_bytes(4, 'big')
+        prefix  = (
+            b"toeplitz-chunk-seed-v2"
+            + master_seed_bytes
+            + int(chunk_idx).to_bytes(4, 'big')
+            + int(nonce).to_bytes(8, 'big')
+        )
         while len(extended) < length:
             h    = hashlib.sha256(prefix + counter.to_bytes(4, 'big')).digest()
             bits = np.unpackbits(np.frombuffer(h, dtype=np.uint8))
@@ -1110,6 +1128,7 @@ class QRNGSessionState:
     epsilon_gate_sum:      float       = 0.0
     epsilon_gate_count:    int         = 0
     epsilon_gate_small_count: int      = 0
+    epsilon_gate_history:  List[float] = field(default_factory=list)
     gate_block_count:      int         = 0
     trust_score_history:   List[float] = field(default_factory=list)
     session_warnings:      List[str]   = field(default_factory=list)
@@ -1180,9 +1199,11 @@ class QRNGSessionState:
         self.gate_total_total += int(n_total)
         self.gate_block_count += 1
         if epsilon_gate is not None:
-            self.epsilon_gate_sum += float(epsilon_gate)
+            epsilon_gate_f = float(epsilon_gate)
+            self.epsilon_gate_sum += epsilon_gate_f
             self.epsilon_gate_count += 1
-            if float(epsilon_gate) <= float(small_bias_threshold):
+            self.epsilon_gate_history.append(epsilon_gate_f)
+            if epsilon_gate_f <= float(small_bias_threshold):
                 self.epsilon_gate_small_count += 1
 
     def record_diagnostics(self,
@@ -1206,6 +1227,34 @@ class QRNGSessionState:
             return None
         return self.epsilon_gate_sum / self.epsilon_gate_count
 
+    def epsilon_gate_running_average(self) -> Optional[float]:
+        """Running average of ε_gate across observed gate-enabled blocks."""
+        return self.cumulative_epsilon_gate_trend()
+
+    def epsilon_gate_moving_average(self, window: int = 5) -> Optional[float]:
+        """Short-window ε_gate moving average for weak-attack diagnostics."""
+        if not self.epsilon_gate_history:
+            return None
+        w = max(int(window), 1)
+        hist = self.epsilon_gate_history[-w:]
+        return float(np.mean(hist))
+
+    def epsilon_gate_drift_indicator(self,
+                                     short_window: int = 5,
+                                     long_window: int = 20) -> Optional[float]:
+        """
+        Drift indicator: short-window mean minus long-window mean.
+        Positive values indicate rising ε_gate; near-zero persistent values
+        can indicate weak-but-steady adversarial influence.
+        """
+        if not self.epsilon_gate_history:
+            return None
+        short_ma = self.epsilon_gate_moving_average(window=short_window)
+        long_ma = self.epsilon_gate_moving_average(window=long_window)
+        if short_ma is None or long_ma is None:
+            return None
+        return float(short_ma - long_ma)
+
     def persistent_small_gate_bias_flag(self, min_blocks: int = 5,
                                         min_ratio: float = 0.70) -> bool:
         """
@@ -1218,6 +1267,26 @@ class QRNGSessionState:
             return False
         ratio = self.epsilon_gate_small_count / max(self.gate_block_count, 1)
         return ratio >= float(min_ratio)
+
+    def weak_adversarial_influence_flag(self,
+                                        min_blocks: int = 8,
+                                        moving_avg_window: int = 6,
+                                        epsilon_band: float = 0.02,
+                                        max_abs_drift: float = 0.003) -> bool:
+        """
+        Detect persistent small ε_gate across blocks with low drift.
+        This is metadata-only detection and must not feed entropy/extraction.
+        """
+        if self.epsilon_gate_count < max(int(min_blocks), 1):
+            return False
+        moving_avg = self.epsilon_gate_moving_average(window=moving_avg_window)
+        drift = self.epsilon_gate_drift_indicator(
+            short_window=moving_avg_window,
+            long_window=max(2 * moving_avg_window, moving_avg_window + 1),
+        )
+        if moving_avg is None or drift is None:
+            return False
+        return (moving_avg <= float(epsilon_band)) and (abs(drift) <= float(max_abs_drift))
 
 
 # ---------------------------------------------------------------------------
@@ -2062,6 +2131,14 @@ class TrustEnhancedQRNG:
             warning=merged_warning,
             anomalies=diagnostic_state.get('anomalies', []),
         )
+        weak_influence_flag = session.weak_adversarial_influence_flag()
+        if weak_influence_flag:
+            diagnostic_state.setdefault('anomalies', []).append(
+                "possible weak adversarial influence"
+            )
+            weak_note = "possible weak adversarial influence"
+            merged_warning = (f"{merged_warning} | {weak_note}"
+                              if merged_warning else weak_note)
 
         # Compute EAT values from session state
         h_total_eat = session.accumulate_eat(self.epsilon_eat)
@@ -2122,7 +2199,12 @@ class TrustEnhancedQRNG:
             'gate_persistent_small_bias_flag': gate_meta['persistent_small_bias_flag'],
             # Selection-bias monitoring only (diagnostic, no entropy coupling):
             'cumulative_gate_yield': session.cumulative_gate_yield(),
+            'cumulative_epsilon_gate': session.cumulative_epsilon_gate_trend(),
+            'epsilon_gate_running_average': session.epsilon_gate_running_average(),
             'cumulative_epsilon_gate_trend': session.cumulative_epsilon_gate_trend(),
+            'epsilon_gate_drift_indicator': session.epsilon_gate_drift_indicator(),
+            'epsilon_gate_moving_average': session.epsilon_gate_moving_average(),
+            'weak_adversarial_influence_flag': weak_influence_flag,
         }
         return meta
 

@@ -38,7 +38,7 @@ v15 — Batch 6 fix: A3
         - 'output_length' field added (was missing from block meta, present in cert_bundle).
       Changes in generate_certified_random_bits():
         - Return type annotation changed from Tuple[np.ndarray, List[Dict]] to
-          Tuple[np.ndarray, List[Union[BlockMetadata, EATSummary]]].
+          Tuple[np.ndarray, List[Union[BlockMetadata, FinalDecision, EATSummary]]].
         - halt_meta 'blocks_accumulated' key renamed to 'blocks_used'.
       No logic changes — pure schema formalisation and naming unification.
 
@@ -107,7 +107,7 @@ Security invariants (unchanged throughout all versions)
 import numpy as np
 from scipy import stats
 from dataclasses import dataclass, field
-from typing import Tuple, Dict, List, Optional, Union
+from typing import Tuple, Dict, List, Optional, Union, Literal, cast
 try:
     from typing import TypedDict
 except ImportError:          # Python < 3.8 fallback
@@ -199,6 +199,35 @@ class EATSummary(TypedDict):
     sum_f_ei:              float  # Raw entropy sum before penalty: Σ h_min_i·n_gen_i
 
 
+class FinalDecision(TypedDict):
+    """
+    Schema for Layer-3 post-certification decision output.
+
+    Layer-3 is strictly observational/policy logic applied after
+    EAT accumulation and final extraction. It MUST NOT modify entropy,
+    extraction length, or EAT results.
+    """
+    accepted:       bool
+    status:         Literal["ACCEPT", "WARN", "REJECT"]
+    reason:         str
+    certified_bits: int
+    returned_bits:  int
+
+
+class GateMetadata(TypedDict):
+    """
+    Schema for pre-value gate metadata (Layer-1 diagnostic fields).
+    """
+    enabled:      bool
+    tau:          Optional[float]
+    n_total:      int
+    n_accepted:   int
+    yield_rate:   Optional[float]
+    epsilon_gate: Optional[float]
+    imr:          Optional[float]
+    sigma:        Optional[float]
+
+
 # ---------------------------------------------------------------------------
 # TrustVector
 # ---------------------------------------------------------------------------
@@ -288,7 +317,15 @@ class EATConvergenceWarning(Exception):
     with no signal to the caller. A partial return is indistinguishable from
     a normal return without checking output length against n_bits.
     """
-    pass
+    def __init__(self, total_gen: int, requested_bits: int, h_total_eat: float):
+        self.total_gen = int(total_gen)
+        self.requested_bits = int(requested_bits)
+        self.h_total_eat = float(h_total_eat)
+        super().__init__(
+            "CertifiedGenerationSession.run: EAT convergence not reached; "
+            f"requested_bits={self.requested_bits}, total_gen={self.total_gen}, "
+            f"h_total_eat={self.h_total_eat:.6f}."
+        )
 
 
 class ExtractionFailureError(Exception):
@@ -629,7 +666,7 @@ class PreValueGate:
               raw_signal: np.ndarray,
               bits:       np.ndarray,
               bases:      np.ndarray
-              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, GateMetadata]:
         n_total     = len(raw_signal)
         gate_mask   = np.abs(raw_signal) > self.tau
 
@@ -649,7 +686,8 @@ class PreValueGate:
         imr_val = float(norm.pdf(self.tau / self.sigma) /
                         max(norm.sf(self.tau / self.sigma), 1e-15))
 
-        gate_meta = {
+        gate_meta: GateMetadata = {
+            'enabled':      True,
             'tau':          self.tau,
             'n_total':      n_total,
             'n_accepted':   n_accepted,
@@ -1027,6 +1065,73 @@ class QRNGSessionState:
 
 
 # ---------------------------------------------------------------------------
+# Layer-3 FinalDecisionLayer
+# ---------------------------------------------------------------------------
+
+class FinalDecisionLayer:
+    """
+    Layer-3 post-certification decision logic.
+
+    IMPORTANT:
+      - Never modifies entropy values.
+      - Never modifies extraction length.
+      - Never modifies EAT result.
+      - Only classifies the already-produced output as ACCEPT/WARN/REJECT.
+    """
+    def __init__(self,
+                 halt_threshold: float = DiagnosticHaltError.HALT_THRESHOLD,
+                 warn_threshold: float = DiagnosticHaltError.WARN_THRESHOLD):
+        self.halt_threshold = halt_threshold
+        self.warn_threshold = warn_threshold
+
+    def evaluate(self,
+                 final_bits: np.ndarray,
+                 eat_summary: EATSummary,
+                 last_block_meta: Optional[BlockMetadata],
+                 trust_score: float,
+                 epsilon_gate: Optional[float] = None) -> FinalDecision:
+        certified_bits = int(eat_summary['certified_output_bits'])
+        returned_bits = int(len(final_bits))
+
+        reason_parts: List[str] = []
+        if epsilon_gate is not None:
+            reason_parts.append(f"epsilon_gate={epsilon_gate:.6f}")
+        if last_block_meta is not None and last_block_meta['diagnostic_warning'] is not None:
+            reason_parts.append(last_block_meta['diagnostic_warning'])
+
+        if trust_score < self.halt_threshold:
+            return {
+                'accepted': False,
+                'status': 'REJECT',
+                'reason': ("Trust score below halt threshold "
+                           f"({trust_score:.4f} < {self.halt_threshold:.4f})"
+                           + (f"; {' | '.join(reason_parts)}" if reason_parts else "")),
+                'certified_bits': certified_bits,
+                'returned_bits': returned_bits,
+            }
+
+        if trust_score < self.warn_threshold:
+            return {
+                'accepted': True,
+                'status': 'WARN',
+                'reason': ("Trust score below warn threshold "
+                           f"({trust_score:.4f} < {self.warn_threshold:.4f})"
+                           + (f"; {' | '.join(reason_parts)}" if reason_parts else "")),
+                'certified_bits': certified_bits,
+                'returned_bits': returned_bits,
+            }
+
+        return {
+            'accepted': True,
+            'status': 'ACCEPT',
+            'reason': ("Trust score within normal operating range"
+                       + (f"; {' | '.join(reason_parts)}" if reason_parts else "")),
+            'certified_bits': certified_bits,
+            'returned_bits': returned_bits,
+        }
+
+
+# ---------------------------------------------------------------------------
 # A5 FIX — CertifiedGenerationSession (NEW CLASS)
 # ---------------------------------------------------------------------------
 
@@ -1070,7 +1175,7 @@ class CertifiedGenerationSession:
 
     def run(self,
             n_bits:           int,
-            source_simulator) -> Tuple[np.ndarray, List[Union[BlockMetadata, EATSummary]]]:
+            source_simulator) -> Tuple[np.ndarray, List[Union[BlockMetadata, FinalDecision, EATSummary]]]:
         """
         Generate n_bits with full composable EAT-certified security.
 
@@ -1104,7 +1209,7 @@ class CertifiedGenerationSession:
         session = QRNGSessionState()
 
         all_gen_bits:  List[np.ndarray]                         = []
-        metadata_list: List[Union[BlockMetadata, EATSummary]]  = []
+        metadata_list: List[Union[BlockMetadata, FinalDecision, EATSummary]]  = []
 
         block_size = self.te_qrng.block_size
         while True:
@@ -1148,10 +1253,9 @@ class CertifiedGenerationSession:
             total_gen = sum(len(g) for g in all_gen_bits)
             if total_gen > 50 * n_bits:
                 raise EATConvergenceWarning(
-                    "CertifiedGenerationSession.run: EAT convergence not reached; "
-                    f"requested_bits={n_bits}, total_gen={total_gen}, "
-                    f"max_total_gen={50 * n_bits}, blocks_used={len(session.block_entropy_history)}, "
-                    f"h_total_eat={h_total:.6f}, max_output_bits={max_output_bits}."
+                    total_gen=total_gen,
+                    requested_bits=n_bits,
+                    h_total_eat=h_total,
                 )
 
         # Global final Toeplitz extraction
@@ -1206,6 +1310,27 @@ class CertifiedGenerationSession:
             'delta_eat':             delta_eat,
             'sum_f_ei':              sum_f_ei,
         }
+
+        last_block_meta: Optional[BlockMetadata] = None
+        if len(metadata_list) > 0:
+            possible_block_meta = metadata_list[-1]
+            if 'trust_score' in possible_block_meta:
+                last_block_meta = cast(BlockMetadata, possible_block_meta)
+
+        trust_score = (last_block_meta['trust_score']
+                       if last_block_meta is not None else 1.0)
+        epsilon_gate = (last_block_meta['epsilon_gate']
+                        if last_block_meta is not None else None)
+
+        decision_layer = FinalDecisionLayer()
+        final_decision = decision_layer.evaluate(
+            final_bits=final_bits[:n_bits],
+            eat_summary=eat_summary,
+            last_block_meta=last_block_meta,
+            trust_score=trust_score,
+            epsilon_gate=epsilon_gate,
+        )
+        metadata_list.append(final_decision)
         metadata_list.append(eat_summary)
 
         return final_bits[:n_bits], metadata_list
@@ -1383,7 +1508,16 @@ class TrustEnhancedQRNG:
         rather than on self. append_block() delegates to session.
         """
         # Step 0: Pre-value gating (Layer 1)
-        gate_meta: Dict = {'enabled': False}
+        gate_meta: GateMetadata = {
+            'enabled': False,
+            'tau': None,
+            'n_total': n_raw,
+            'n_accepted': n_raw,
+            'yield_rate': None,
+            'epsilon_gate': None,
+            'imr': None,
+            'sigma': None,
+        }
         if self.enable_gating and raw_signal is not None and len(raw_signal) == n_raw:
             self.pre_value_gate.update_tau(self.trust_vector.epsilon_bias)
 
@@ -1391,7 +1525,6 @@ class TrustEnhancedQRNG:
                 raw_signal, raw_bits,
                 bases if bases is not None else np.zeros(n_raw, dtype=np.uint8)
             )
-            gate_meta['enabled'] = True
             if bases is not None:
                 bases      = bases_gated
             raw_signal = raw_signal[np.abs(raw_signal) > self.pre_value_gate.tau]
@@ -1517,7 +1650,7 @@ class TrustEnhancedQRNG:
     def _assemble_metadata(self,
                            cert:              Dict,
                            n_raw:             int,
-                           gate_meta:         Dict,
+                           gate_meta:         GateMetadata,
                            trust_vector:      TrustVector,
                            diagnostic_warning: Optional[str],
                            output_bits_len:   int,
@@ -1586,13 +1719,13 @@ class TrustEnhancedQRNG:
             'input_bits':          n_raw,
             'cumulative_efficiency': (session.total_output_bits /
                                       max(session.total_raw_input_bits, 1)),
-            'gate_enabled':      gate_meta.get('enabled', False),
-            'gate_tau':          gate_meta.get('tau', None),
-            'gate_yield':        gate_meta.get('yield_rate', None),
-            'epsilon_gate':      gate_meta.get('epsilon_gate', None),
-            'gate_imr':          gate_meta.get('imr', None),
-            'gate_n_accepted':   gate_meta.get('n_accepted', n_raw),
-            'gate_n_total':      gate_meta.get('n_total', n_raw),
+            'gate_enabled':      gate_meta['enabled'],
+            'gate_tau':          gate_meta['tau'],
+            'gate_yield':        gate_meta['yield_rate'],
+            'epsilon_gate':      gate_meta['epsilon_gate'],
+            'gate_imr':          gate_meta['imr'],
+            'gate_n_accepted':   gate_meta['n_accepted'],
+            'gate_n_total':      gate_meta['n_total'],
         }
         return meta
 
@@ -1671,7 +1804,7 @@ class TrustEnhancedQRNG:
 
     def generate_certified_random_bits(self,
                                        n_bits:           int,
-                                       source_simulator) -> Tuple[np.ndarray, List[Union[BlockMetadata, EATSummary]]]:
+                                       source_simulator) -> Tuple[np.ndarray, List[Union[BlockMetadata, FinalDecision, EATSummary]]]:
         """
         Backward-compatible shim — delegates to CertifiedGenerationSession.
 

@@ -38,7 +38,7 @@ v15 — Batch 6 fix: A3
         - 'output_length' field added (was missing from block meta, present in cert_bundle).
       Changes in generate_certified_random_bits():
         - Return type annotation changed from Tuple[np.ndarray, List[Dict]] to
-          Tuple[np.ndarray, List[Union[BlockMetadata, FinalDecision, EATSummary]]].
+          Tuple[np.ndarray, List[Union[BlockMetadata, EATSummary]]].
         - halt_meta 'blocks_accumulated' key renamed to 'blocks_used'.
       No logic changes — pure schema formalisation and naming unification.
 
@@ -184,6 +184,10 @@ class EATSummary(TypedDict):
     It is distinguishable from BlockMetadata by position (always last)
     and by the presence of 'certified_output_bits' / 'actual_output_bits'
     which do not appear in per-block metadata.
+
+    Backward-compatibility invariant: metadata_list[:-1] remains block-only
+    BlockMetadata entries. Layer-3 final decision is nested under this summary
+    as `final_decision` instead of being inserted as a separate list element.
     """
     certified_quantity:    str
     security_definition:   str
@@ -197,6 +201,7 @@ class EATSummary(TypedDict):
     actual_output_bits:    int    # Bits actually returned (≤ certified_output_bits)
     delta_eat:             float  # EAT penalty: 2·√N·√(ln(1/ε_EAT))
     sum_f_ei:              float  # Raw entropy sum before penalty: Σ h_min_i·n_gen_i
+    final_decision:        'FinalDecision'
 
 
 class FinalDecision(TypedDict):
@@ -1175,7 +1180,7 @@ class CertifiedGenerationSession:
 
     def run(self,
             n_bits:           int,
-            source_simulator) -> Tuple[np.ndarray, List[Union[BlockMetadata, FinalDecision, EATSummary]]]:
+            source_simulator) -> Tuple[np.ndarray, List[Union[BlockMetadata, EATSummary]]]:
         """
         Generate n_bits with full composable EAT-certified security.
 
@@ -1209,7 +1214,7 @@ class CertifiedGenerationSession:
         session = QRNGSessionState()
 
         all_gen_bits:  List[np.ndarray]                         = []
-        metadata_list: List[Union[BlockMetadata, FinalDecision, EATSummary]]  = []
+        metadata_list: List[Union[BlockMetadata, EATSummary]]  = []
 
         block_size = self.te_qrng.block_size
         while True:
@@ -1330,7 +1335,7 @@ class CertifiedGenerationSession:
             trust_score=trust_score,
             epsilon_gate=epsilon_gate,
         )
-        metadata_list.append(final_decision)
+        eat_summary['final_decision'] = final_decision
         metadata_list.append(eat_summary)
 
         return final_bits[:n_bits], metadata_list
@@ -1804,7 +1809,7 @@ class TrustEnhancedQRNG:
 
     def generate_certified_random_bits(self,
                                        n_bits:           int,
-                                       source_simulator) -> Tuple[np.ndarray, List[Union[BlockMetadata, FinalDecision, EATSummary]]]:
+                                       source_simulator) -> Tuple[np.ndarray, List[Union[BlockMetadata, EATSummary]]]:
         """
         Backward-compatible shim — delegates to CertifiedGenerationSession.
 

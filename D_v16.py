@@ -174,6 +174,8 @@ class BlockMetadata(TypedDict):
     gate_imr:              Optional[float]
     gate_n_accepted:       int
     gate_n_total:          int
+    cumulative_gate_yield: Optional[float]
+    cumulative_epsilon_gate_trend: Optional[float]
 
 
 class EATSummary(TypedDict):
@@ -1031,6 +1033,12 @@ class QRNGSessionState:
     total_output_bits:     int         = 0
     total_gen_input_bits:  int         = 0
     total_raw_input_bits:  int         = 0
+    block_h_min_history:   List[float] = field(default_factory=list)
+    block_extraction_rate_history: List[float] = field(default_factory=list)
+    gate_accepted_total:   int         = 0
+    gate_total_total:      int         = 0
+    epsilon_gate_sum:      float       = 0.0
+    epsilon_gate_count:    int         = 0
 
     def accumulate_eat(self, epsilon_eat: float) -> float:
         """
@@ -1070,6 +1078,38 @@ class QRNGSessionState:
         """
         self.block_entropy_history.append(h_min_certified * n_gen)
         self.block_n_gen_history.append(n_gen)
+        self.block_h_min_history.append(h_min_certified)
+
+    def update_extraction_rate(self, extraction_rate: float) -> None:
+        """Track per-block extraction rate for diagnostic consistency checks."""
+        self.block_extraction_rate_history.append(float(extraction_rate))
+
+    def update_gate_tracking(self,
+                             n_accepted: int,
+                             n_total: int,
+                             epsilon_gate: Optional[float]) -> None:
+        """
+        Track cumulative gate quantities.
+
+        NOTE: pre-value gating introduces selection bias because only accepted
+        samples are forwarded. We monitor this bias trend here; we do NOT
+        correct entropy formulas at this stage.
+        """
+        self.gate_accepted_total += int(n_accepted)
+        self.gate_total_total += int(n_total)
+        if epsilon_gate is not None:
+            self.epsilon_gate_sum += float(epsilon_gate)
+            self.epsilon_gate_count += 1
+
+    def cumulative_gate_yield(self) -> Optional[float]:
+        if self.gate_total_total <= 0:
+            return None
+        return self.gate_accepted_total / self.gate_total_total
+
+    def cumulative_epsilon_gate_trend(self) -> Optional[float]:
+        if self.epsilon_gate_count <= 0:
+            return None
+        return self.epsilon_gate_sum / self.epsilon_gate_count
 
 
 # ---------------------------------------------------------------------------
@@ -1323,16 +1363,16 @@ class CertifiedGenerationSession:
         }
 
         decision_layer = FinalDecisionLayer()
-
+        last_block_meta = metadata_list[-1] if metadata_list else None
+        metadata_list.append(eat_summary)
+        # FinalDecision is evaluated only after final_bits and EATSummary exist.
         final_decision = decision_layer.evaluate(
             final_bits=final_bits,
             eat_summary=eat_summary,
-            last_block_meta=metadata_list[-1] if metadata_list else None,
-            trust_score=metadata_list[-1]['trust_score'] if metadata_list else 1.0,
-            epsilon_gate=metadata_list[-1].get('epsilon_gate', None) if metadata_list else None,
+            last_block_meta=last_block_meta,
+            trust_score=last_block_meta['trust_score'] if last_block_meta else 1.0,
+            epsilon_gate=last_block_meta.get('epsilon_gate', None) if last_block_meta else None,
         )
-
-        metadata_list.append(eat_summary)
         metadata_list.append(final_decision)
 
         # Enforce deterministic metadata ordering for downstream consumers:
@@ -1537,6 +1577,11 @@ class TrustEnhancedQRNG:
         if self.enable_gating and raw_signal is not None and len(raw_signal) == n_raw:
             self.pre_value_gate.update_tau(self.trust_vector.epsilon_bias)
 
+            # Selection-bias note:
+            # Gating accepts only |signal| > tau samples, which can skew sample
+            # composition relative to the original stream. This bias is tracked
+            # in metadata (gate_yield / epsilon_gate cumulants) but is not
+            # corrected in entropy formulas at this stage.
             _, raw_bits, bases_gated, gate_meta = self.pre_value_gate.apply(
                 raw_signal, raw_bits,
                 bases if bases is not None else np.zeros(n_raw, dtype=np.uint8)
@@ -1617,6 +1662,10 @@ class TrustEnhancedQRNG:
                 f"< WARN_THRESHOLD={DiagnosticHaltError.WARN_THRESHOLD}. "
                 f"h_min_certified={h_min_certified:.4f} is unaffected."
             )
+        if epsilon_gate is not None:
+            gate_note = f"epsilon_gate={epsilon_gate:.6f} (selection-bias monitor only)"
+            diagnostic_warning = (f"{diagnostic_warning} | {gate_note}"
+                                  if diagnostic_warning else gate_note)
 
         return trust_vector, diagnostic_warning
 
@@ -1693,11 +1742,24 @@ class TrustEnhancedQRNG:
         h_min_certified = cert['h_min_certified']
         output_length   = cert['output_length']
         extraction_rate = cert['extraction_rate']
+        consistency_warning = self._cross_block_consistency_warning(
+            h_min_certified, extraction_rate, session
+        )
+        merged_warning = diagnostic_warning
+        if consistency_warning is not None:
+            merged_warning = (f"{diagnostic_warning} | {consistency_warning}"
+                              if diagnostic_warning else consistency_warning)
 
         # Update throughput counters in session (A5 FIX: was self.total_*)
         session.total_raw_input_bits  += n_raw
         session.total_gen_input_bits  += n_gen
         session.total_output_bits     += output_bits_len
+        session.update_extraction_rate(extraction_rate)
+        session.update_gate_tracking(
+            gate_meta['n_accepted'],
+            gate_meta['n_total'],
+            gate_meta['epsilon_gate'],
+        )
 
         # Compute EAT values from session state
         h_total_eat = session.accumulate_eat(self.epsilon_eat)
@@ -1734,7 +1796,7 @@ class TrustEnhancedQRNG:
                 'epsilon_corr':  trust_vector.epsilon_corr,
                 'epsilon_leak':  trust_vector.epsilon_leak,
             },
-            'diagnostic_warning':  diagnostic_warning,
+            'diagnostic_warning':  merged_warning,
             'halt_threshold':      DiagnosticHaltError.HALT_THRESHOLD,
             'warn_threshold':      DiagnosticHaltError.WARN_THRESHOLD,
             'input_bits':          n_raw,
@@ -1747,8 +1809,50 @@ class TrustEnhancedQRNG:
             'gate_imr':          gate_meta['imr'],
             'gate_n_accepted':   gate_meta['n_accepted'],
             'gate_n_total':      gate_meta['n_total'],
+            # Selection-bias monitoring only (diagnostic, no entropy coupling):
+            'cumulative_gate_yield': session.cumulative_gate_yield(),
+            'cumulative_epsilon_gate_trend': session.cumulative_epsilon_gate_trend(),
         }
         return meta
+
+    def _cross_block_consistency_warning(self,
+                                         h_min_certified: float,
+                                         extraction_rate: float,
+                                         session: QRNGSessionState
+                                         ) -> Optional[str]:
+        """
+        Lightweight cross-block consistency diagnostics.
+
+        Detects large deviations relative to prior block history for:
+          - h_min_certified
+          - extraction_rate
+        This is strictly observational and never alters entropy/extraction.
+        """
+        warnings: List[str] = []
+
+        if session.block_h_min_history:
+            prev_h = np.asarray(session.block_h_min_history, dtype=np.float64)
+            ref_h = float(np.median(prev_h))
+            scale_h = float(max(np.median(np.abs(prev_h - ref_h)), 1e-6))
+            if abs(h_min_certified - ref_h) > 6.0 * scale_h:
+                warnings.append(
+                    f"cross-block inconsistency: h_min_certified jump "
+                    f"(current={h_min_certified:.4f}, median={ref_h:.4f})"
+                )
+
+        if session.block_extraction_rate_history:
+            prev_r = np.asarray(session.block_extraction_rate_history, dtype=np.float64)
+            ref_r = float(np.median(prev_r))
+            scale_r = float(max(np.median(np.abs(prev_r - ref_r)), 1e-6))
+            if abs(extraction_rate - ref_r) > 6.0 * scale_r:
+                warnings.append(
+                    f"cross-block inconsistency: extraction_rate jump "
+                    f"(current={extraction_rate:.4f}, median={ref_r:.4f})"
+                )
+
+        if not warnings:
+            return None
+        return " ; ".join(warnings)
 
     # ------------------------------------------------------------------
     # Block processing pipeline — public orchestrator

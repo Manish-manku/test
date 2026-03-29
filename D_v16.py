@@ -372,6 +372,17 @@ class ExtractionFailureError(Exception):
     pass
 
 
+class ExtractionConfigurationError(Exception):
+    """
+    Raised when extractor dimensions exceed the configured single-pass limits.
+
+    Security policy: extraction mode must be selected explicitly by operators.
+    The extractor MUST NOT silently switch to chunked domain separation based
+    on runtime memory pressure or block-size overflow.
+    """
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Calibrated sigmoid helper
 # ---------------------------------------------------------------------------
@@ -1044,86 +1055,38 @@ class RandomnessExtractor:
             )
 
         single_circ = 1 << int(np.ceil(np.log2(max(m + n, 2))))
-        if single_circ <= self._MAX_CIRC_SIZE:
-            required = n + m - 1
-            if len(seed) < required:
-                seed = self._extend_seed(seed, required)
+        if single_circ > self._MAX_CIRC_SIZE:
+            raise ExtractionConfigurationError(
+                f"toeplitz_extract: requested single-pass FFT size {single_circ} exceeds "
+                f"MAX_CIRC_SIZE={self._MAX_CIRC_SIZE}. "
+                "Define chunking explicitly in configuration; automatic fallback is disabled."
+            )
+
+        # Conservative memory estimate for float64/complex128 FFT pipeline:
+        # circ_col(float64) + x_pad(float64) + fft_col(complex128)
+        # + fft_x(complex128) + y_full(float64) ~= 48 bytes per element.
+        estimated_bytes = int(single_circ * 48)
+        max_bytes = int(getattr(self, '_MAX_SINGLE_PASS_BYTES', 512 * 1024 * 1024))
+        if estimated_bytes > max_bytes:
+            raise ExtractionConfigurationError(
+                "toeplitz_extract: estimated single-pass FFT working set "
+                f"{estimated_bytes / (1024 ** 2):.1f} MiB exceeds configured "
+                f"limit {max_bytes / (1024 ** 2):.1f} MiB. "
+                "Define chunking explicitly in configuration; automatic fallback is disabled."
+            )
+
+        required = n + m - 1
+        if len(seed) < required:
+            seed = self._extend_seed(seed, required)
+
+        try:
             return self._toeplitz_fft_chunk(weak_random, seed, m)
-
-        max_raw_size   = max(self._MAX_CIRC_SIZE // 2, 2)
-        max_chunk_in   = max(max_raw_size // 2, 1024)
-        n_chunks       = max(int(np.ceil(n / max_chunk_in)), 1)
-        n_c            = int(np.ceil(n / n_chunks))
-
-        seed_bits = np.asarray(seed, dtype=np.uint8).flatten()
-
-        output_chunks: List[np.ndarray] = []
-        bits_produced = 0
-        chunk_seed_nonce = 0
-        chunk_seed_offset = 0
-
-        for i in range(n_chunks):
-            i_start = i * n_c
-            i_end   = min(i_start + n_c, n)
-            chunk   = weak_random[i_start:i_end]
-            nc_i    = len(chunk)
-            if nc_i == 0:
-                continue
-
-            max_mc_i = max(max_raw_size - nc_i, 1)
-            remaining = m - bits_produced
-            while remaining > 0:
-                mc_i = min(remaining, max_mc_i)
-                if mc_i <= 0:
-                    raise ExtractionFailureError(
-                        f"toeplitz_extract: unable to size chunk safely (nc_i={nc_i}, "
-                        f"max_raw_size={max_raw_size}, remaining={remaining})."
-                    )
-
-                # Information-theoretic chunk seeding: consume disjoint windows
-                # from user-supplied seed material (no hash-based expansion).
-                chunk_seed = self._derive_chunk_seed(
-                    seed_bits,
-                    chunk_seed_offset,
-                    chunk_seed_nonce,
-                    nc_i + mc_i - 1,
-                )
-                chunk_seed_offset += (nc_i + mc_i - 1)
-                try:
-                    out_chunk = self._toeplitz_fft_chunk(chunk, chunk_seed, mc_i)
-                except (MemoryError, ValueError) as exc:
-                    raise ExtractionFailureError(
-                        f"toeplitz_extract: FFT chunk failed for nc_i={nc_i}, mc_i={mc_i}, "
-                        f"chunk_idx={i}, chunk_seed_nonce={chunk_seed_nonce}, "
-                        f"chunk_seed_offset={chunk_seed_offset - (nc_i + mc_i - 1)}."
-                    ) from exc
-
-                output_chunks.append(out_chunk)
-                bits_produced += len(out_chunk)
-                remaining = m - bits_produced
-
-                if bits_produced >= m:
-                    break
-            if bits_produced >= m:
-                break
-
-        if not output_chunks:
-            raise ExtractionFailureError(
-                f"toeplitz_extract: chunked path produced no output. "
-                f"n={n}, m={m}, n_chunks={n_chunks}. "
-                "This would previously have returned all-zero bits silently."
-            )
-
-        result = np.concatenate(output_chunks)
-
-        if len(result) < m:
-            raise ExtractionFailureError(
-                f"toeplitz_extract: chunked path produced {len(result)} bits "
-                f"but {m} were requested. "
-                f"n={n}, m={m}, n_chunks={n_chunks}, bits_produced={len(result)}."
-            )
-
-        return result[:m]
+        except MemoryError as exc:
+            raise ExtractionConfigurationError(
+                "toeplitz_extract: single-pass FFT failed due to memory pressure. "
+                "Automatic chunked fallback is disabled; configure chunked extraction "
+                "explicitly for this deployment."
+            ) from exc
 
     def _derive_chunk_seed(self, master_seed_bits: np.ndarray,
                             seed_offset: int, nonce: int, length: int) -> np.ndarray:
@@ -2045,13 +2008,26 @@ class TrustEnhancedQRNG:
 
         if len(b) >= 4:
             # Structured-pattern heuristic (diagnostic only).
+            # Use n_test-scaled confidence bounds to reduce false alarms on
+            # smaller blocks where finite-sample fluctuations are larger.
             x = (2.0 * b.astype(np.float64)) - 1.0
             lag1_corr = float(np.mean(x[1:] * x[:-1]))
             alternation_rate = float(np.mean(b[1:] != b[:-1]))
-            if (abs(lag1_corr) > (1.0 - self.basis_pattern_threshold) or
-                    alternation_rate > (1.0 - 0.5 * self.basis_pattern_threshold)):
+
+            n_eff = max(int(min(n_test, len(b))), 2)
+            n_pairs = max(n_eff - 1, 1)
+            # pattern_threshold acts as a z-score multiplier with floor 1.0
+            z_mult = max(float(getattr(self, 'basis_pattern_threshold', 3.0)), 1.0)
+            lag1_std = 1.0 / np.sqrt(float(n_pairs))
+            alt_std = 0.5 / np.sqrt(float(n_pairs))
+
+            lag1_bound = z_mult * lag1_std
+            alt_upper = 0.5 + z_mult * alt_std
+            alt_lower = 0.5 - z_mult * alt_std
+
+            if abs(lag1_corr) > lag1_bound or not (alt_lower <= alternation_rate <= alt_upper):
                 warnings.append(
-                    "basis anomaly heuristic triggered (structured pattern / high serial dependence)."
+                    "basis anomaly heuristic triggered (n_test-scaled serial dependence bounds exceeded)."
                 )
                 anomaly_flag = True
 

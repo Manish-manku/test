@@ -124,8 +124,9 @@ class BlockMetadata(TypedDict):
     """
     Schema for every block-level metadata dict produced by process_block().
 
-    These are the entries at positions [0 .. -2] of the metadata_list returned
-    by generate_certified_random_bits().  The final entry is an EATSummary.
+    These are the entries at positions [0 .. -3] of the metadata_list returned
+    by generate_certified_random_bits(). The final two entries are, in order:
+    EATSummary (second last), then FinalDecision (last).
 
     All callers should use typed access (meta['h_min_certified']) rather than
     .get() with fallbacks, because every field listed here is always present.
@@ -181,7 +182,7 @@ class EATSummary(TypedDict):
     generate_certified_random_bits().
 
     This is the global EAT accumulation result across all blocks.
-    It is distinguishable from BlockMetadata by position (always last)
+    It is distinguishable from BlockMetadata by position (always second last)
     and by the presence of 'certified_output_bits' / 'actual_output_bits'
     which do not appear in per-block metadata.
     """
@@ -249,9 +250,11 @@ class TrustVector:
     epsilon_leak:  float = 0.0
 
     def trust_score(self) -> float:
-        """Compute aggregate trust score [0, 1], where 1 = perfect trust.
+        """Compute aggregate diagnostic trust score in [0, 1], where 1 = best.
 
         F1 FIX: result is clamped to [0, 1].
+        This score is diagnostic only and MUST NEVER influence entropy
+        certification, extraction length, or EAT accounting.
         Without the clamp, if any epsilon component exceeds 1.0 (possible when
         TrustVector is constructed directly with out-of-range values), the norm
         can exceed 2.0 and the score goes negative. A negative trust_score
@@ -737,10 +740,15 @@ class EntropyEstimator:
     """
 
     def __init__(self, security_parameter: float = 1e-6):
-        self.epsilon_total  = security_parameter
+        # Composable security accounting:
+        #   ε_total = ε_eat + ε_smooth + ε_ext
+        # Keep public API stable by interpreting security_parameter as the
+        # per-component budget. These three terms are independent components in
+        # composable proofs and must remain explicit throughout metadata.
         self.epsilon_eat    = security_parameter
         self.epsilon_smooth = security_parameter
         self.epsilon_ext    = security_parameter
+        self.epsilon_total  = self.epsilon_eat + self.epsilon_smooth + self.epsilon_ext
 
     def certify_min_entropy(self,
                             bits:  np.ndarray,
@@ -1189,8 +1197,8 @@ class CertifiedGenerationSession:
 
         Returns:
             (final_bits[:n_bits], metadata_list)
-            metadata_list[-1] is always an EATSummary.
-            metadata_list[:-1] are BlockMetadata dicts, one per block.
+            metadata_list structure is always:
+                [BlockMetadata, ..., EATSummary, FinalDecision]
 
         Raises:
             ValueError:              n_bits <= 0
@@ -1296,10 +1304,13 @@ class CertifiedGenerationSession:
                      np.sqrt(np.log(1.0 / self.epsilon_eat))
                      if t_blocks > 0 else 0.0)
 
+        # Independent composable terms:
+        #   ε_total = ε_eat + ε_smooth + ε_ext
+        epsilon_total = self.epsilon_eat + self.te_qrng.epsilon_smooth + self.epsilon_ext
         eat_summary: EATSummary = {
             'certified_quantity':    'H_min(X|E)',
             'security_definition':   'Trace-distance ε-security',
-            'epsilon_total':         self.te_qrng.epsilon_total,
+            'epsilon_total':         epsilon_total,
             'epsilon_eat':           self.epsilon_eat,
             'epsilon_smooth':        self.te_qrng.epsilon_smooth,
             'epsilon_ext':           self.epsilon_ext,
@@ -1323,6 +1334,15 @@ class CertifiedGenerationSession:
 
         metadata_list.append(eat_summary)
         metadata_list.append(final_decision)
+
+        # Enforce deterministic metadata ordering for downstream consumers:
+        # [BlockMetadata, ..., EATSummary, FinalDecision]
+        if len(metadata_list) < 2:
+            raise RuntimeError("metadata_list must contain EATSummary and FinalDecision.")
+        if not (isinstance(metadata_list[-2], dict) and 'certified_output_bits' in metadata_list[-2]):
+            raise RuntimeError("metadata_list[-2] must be an EATSummary.")
+        if not (isinstance(metadata_list[-1], dict) and 'status' in metadata_list[-1] and 'accepted' in metadata_list[-1]):
+            raise RuntimeError("metadata_list[-1] must be a FinalDecision.")
 
         return final_bits[:n_bits], metadata_list
 
@@ -1401,11 +1421,12 @@ class TrustEnhancedQRNG:
             tau_init  = 0.5,
         )
 
-        # Composable epsilon budget (mirrors EntropyEstimator)
-        self.epsilon_total  = self.entropy_estimator.epsilon_total
+        # Composable epsilon budget (mirrors EntropyEstimator):
+        #   ε_total = ε_eat + ε_smooth + ε_ext
         self.epsilon_eat    = self.entropy_estimator.epsilon_eat
         self.epsilon_smooth = self.entropy_estimator.epsilon_smooth
         self.epsilon_ext    = self.entropy_estimator.epsilon_ext
+        self.epsilon_total  = self.epsilon_eat + self.epsilon_smooth + self.epsilon_ext
 
         # Diagnostic state (does NOT feed into entropy bound)
         self.trust_vector = TrustVector()
@@ -1683,10 +1704,12 @@ class TrustEnhancedQRNG:
         sum_f_ei    = sum(session.block_entropy_history)
         delta_eat   = sum_f_ei - h_total_eat
 
+        # ε components are independent and explicitly composable:
+        #   ε_total = ε_eat + ε_smooth + ε_ext
         meta: BlockMetadata = {
             'certified_quantity':  'H_min(X|E)',
             'security_definition': 'Trace-distance ε-security',
-            'epsilon_total':       self.epsilon_total,
+            'epsilon_total':       (self.epsilon_eat + self.epsilon_smooth + self.epsilon_ext),
             'epsilon_eat':         self.epsilon_eat,
             'epsilon_smooth':      self.epsilon_smooth,
             'epsilon_ext':         self.epsilon_ext,

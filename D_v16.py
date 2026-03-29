@@ -481,12 +481,15 @@ class StatisticalSelfTester:
         runs      = int(np.count_nonzero(np.diff(bits))) + 1
         prop_ones = float(np.mean(bits))
 
+        if prop_ones <= 0.0 or prop_ones >= 1.0:
+            return False, 0.0
+
         expected_runs = 2 * n * prop_ones * (1 - prop_ones) + 1
         variance_runs = (2 * n * prop_ones * (1 - prop_ones) *
                          (2 * n * prop_ones * (1 - prop_ones) - n) / (n - 1))
 
         if variance_runs <= 0:
-            return True, 1.0
+            return False, 0.0
 
         z_score = (runs - expected_runs) / np.sqrt(variance_runs)
         p_value = 2 * (1 - stats.norm.cdf(abs(z_score)))
@@ -1052,17 +1055,12 @@ class RandomnessExtractor:
         n_chunks       = max(int(np.ceil(n / max_chunk_in)), 1)
         n_c            = int(np.ceil(n / n_chunks))
 
-        seed_bytes = np.packbits(seed[:min(len(seed), 2048)]).tobytes()
+        seed_bits = np.asarray(seed, dtype=np.uint8).flatten()
 
         output_chunks: List[np.ndarray] = []
         bits_produced = 0
-        # Domain-separation nonce for this extraction call. Derived from master
-        # seed bytes so it remains independent from source bits while ensuring
-        # per-call seed namespace separation in chunked Toeplitz mode.
-        chunk_seed_nonce = int.from_bytes(
-            hashlib.sha256(b"toeplitz-chunk-nonce" + seed_bytes).digest()[:8],
-            "big",
-        )
+        chunk_seed_nonce = 0
+        chunk_seed_offset = 0
 
         for i in range(n_chunks):
             i_start = i * n_c
@@ -1082,18 +1080,22 @@ class RandomnessExtractor:
                         f"max_raw_size={max_raw_size}, remaining={remaining})."
                     )
 
-                # Domain-separated chunk seed:
-                #   H(master_seed || chunk_index || per-extraction nonce || counter)
-                # This enforces chunk independence in the chunked extractor path.
+                # Information-theoretic chunk seeding: consume disjoint windows
+                # from user-supplied seed material (no hash-based expansion).
                 chunk_seed = self._derive_chunk_seed(
-                    seed_bytes, i, chunk_seed_nonce, nc_i + mc_i - 1
+                    seed_bits,
+                    chunk_seed_offset,
+                    chunk_seed_nonce,
+                    nc_i + mc_i - 1,
                 )
+                chunk_seed_offset += (nc_i + mc_i - 1)
                 try:
                     out_chunk = self._toeplitz_fft_chunk(chunk, chunk_seed, mc_i)
                 except (MemoryError, ValueError) as exc:
                     raise ExtractionFailureError(
                         f"toeplitz_extract: FFT chunk failed for nc_i={nc_i}, mc_i={mc_i}, "
-                        f"chunk_idx={i}, chunk_seed_nonce={chunk_seed_nonce}."
+                        f"chunk_idx={i}, chunk_seed_nonce={chunk_seed_nonce}, "
+                        f"chunk_seed_offset={chunk_seed_offset - (nc_i + mc_i - 1)}."
                     ) from exc
 
                 output_chunks.append(out_chunk)
@@ -1123,26 +1125,32 @@ class RandomnessExtractor:
 
         return result[:m]
 
-    def _derive_chunk_seed(self, master_seed_bytes: bytes,
-                            chunk_idx: int, nonce: int, length: int) -> np.ndarray:
-        extended: List[int] = []
-        counter = 0
-        prefix  = (
-            b"toeplitz-chunk-seed-v2"
-            + master_seed_bytes
-            + int(chunk_idx).to_bytes(4, 'big')
-            + int(nonce).to_bytes(8, 'big')
-        )
-        while len(extended) < length:
-            h    = hashlib.sha256(prefix + counter.to_bytes(4, 'big')).digest()
-            bits = np.unpackbits(np.frombuffer(h, dtype=np.uint8))
-            extended.extend(bits.tolist())
-            counter += 1
-        return np.array(extended[:length], dtype=np.uint8)
+    def _derive_chunk_seed(self, master_seed_bits: np.ndarray,
+                            seed_offset: int, nonce: int, length: int) -> np.ndarray:
+        if nonce != 0:
+            raise ValueError(
+                "_derive_chunk_seed: nonce-based derivation is disabled. "
+                "Provide sufficient independent seed bits explicitly."
+            )
+
+        master_seed_bits = np.asarray(master_seed_bits, dtype=np.uint8).flatten()
+        start = int(seed_offset)
+        end = start + int(length)
+
+        if end > len(master_seed_bits):
+            raise ValueError(
+                f"_derive_chunk_seed: insufficient seed material. Need bits [{start}:{end}) "
+                f"for seed_offset={seed_offset}, length={length}, but only "
+                f"{len(master_seed_bits)} seed bits provided."
+            )
+
+        return master_seed_bits[start:end].copy()
 
     _MAX_SEED_BITS: int = 10_000_000
 
     def _extend_seed(self, seed: np.ndarray, length: int) -> np.ndarray:
+        seed = np.asarray(seed, dtype=np.uint8).flatten()
+
         if length > self._MAX_SEED_BITS:
             raise ValueError(
                 f"_extend_seed: requested length={length} bits exceeds "
@@ -1150,18 +1158,14 @@ class RandomnessExtractor:
                 "This indicates a logic error upstream."
             )
 
-        seed_bytes = np.packbits(seed).tobytes()
-        extended   = []
-        counter    = 0
+        if len(seed) < length:
+            raise ValueError(
+                f"_extend_seed: LHL-compliant extraction requires an explicit Toeplitz "
+                f"seed of length at least n + m - 1 = {length} bits; only "
+                f"{len(seed)} bits were provided."
+            )
 
-        while len(extended) < length:
-            hash_input  = seed_bytes + counter.to_bytes(4, 'big')
-            hash_output = hashlib.sha256(hash_input).digest()
-            bits        = np.unpackbits(np.frombuffer(hash_output, dtype=np.uint8))
-            extended.extend(bits)
-            counter += 1
-
-        return np.array(extended[:length], dtype=np.uint8)
+        return seed[:length].copy()
 
     def adaptive_extract(self, weak_random: np.ndarray,
                           seed: np.ndarray) -> np.ndarray:
@@ -1220,10 +1224,16 @@ class QRNGSessionState:
 
         Units: everything in BITS (not bits/bit).
 
-            sum_f   = Σᵢ  h_min_i · n_gen_i          [bits]
-            N_total = Σᵢ  n_gen_i                     [bits]
-            Δ_EAT   = 2 · √N_total · √(ln(1/ε_EAT))  [bits]
-            H_total = sum_f − Δ_EAT                   [bits]
+            sum_f   = Σᵢ  h_min_i · n_gen_i                                [bits]
+            N_total = Σᵢ  n_gen_i                                           [bits]
+            Δ_var   = √(2 · N_total · V · ln(1/ε_EAT))                     [bits]
+            Δ_corr  = (2/3) · c · ln(1/ε_EAT)                              [bits]
+            H_total = sum_f − Δ_var − Δ_corr                               [bits]
+
+        where:
+            V = variance proxy of the min-tradeoff function (estimated from
+                per-block h_min values, bounded to [0, 0.25] for binary rounds)
+            c = max single-round tradeoff range (1.0 bit for binary outcomes)
 
         Moved here from TrustEnhancedQRNG.accumulate_eat() — logic is identical,
         only the location changes.
@@ -1236,9 +1246,28 @@ class QRNGSessionState:
         if t == 0:
             return 0.0
 
-        sum_f     = sum(self.block_entropy_history)
-        n_total   = sum(self.block_n_gen_history)
-        delta_eat = 2.0 * np.sqrt(n_total) * np.sqrt(np.log(1.0 / epsilon_eat))
+        if epsilon_eat <= 0.0 or epsilon_eat >= 1.0:
+            raise ValueError(
+                f"accumulate_eat: epsilon_eat must be in (0, 1), got {epsilon_eat}."
+            )
+
+        sum_f   = float(sum(self.block_entropy_history))
+        n_total = int(sum(self.block_n_gen_history))
+        if n_total <= 0:
+            return 0.0
+
+        h_vals = np.asarray(self.block_h_min_history, dtype=np.float64)
+        if h_vals.size <= 1:
+            variance_proxy = 0.0
+        else:
+            variance_proxy = float(np.var(h_vals, ddof=1))
+        variance_proxy = float(np.clip(variance_proxy, 0.0, 0.25))
+
+        c_range = 1.0
+        log_term = float(np.log(1.0 / epsilon_eat))
+        delta_var = float(np.sqrt(2.0 * n_total * variance_proxy * log_term))
+        delta_corr = float((2.0 / 3.0) * c_range * log_term)
+        delta_eat = delta_var + delta_corr
 
         return max(sum_f - delta_eat, 0.0)
 

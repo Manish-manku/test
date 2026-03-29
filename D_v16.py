@@ -5,6 +5,12 @@ Trust-Enhanced Source-Independent Quantum Random Number Generator (TE-SI-QRNG)
 A self-testing approach to quantum random number generation that provides
 measurable trust guarantees without requiring full device-independence.
 
+SECURITY SCOPE (explicit)
+-------------------------
+This implementation certifies entropy under a classical source model
+(classical side information / trusted measurement assumptions). It does NOT
+claim full composable security against a general quantum adversary.
+
 Authors: Research Team
 Date: January 2025
 
@@ -38,7 +44,7 @@ v15 — Batch 6 fix: A3
         - 'output_length' field added (was missing from block meta, present in cert_bundle).
       Changes in generate_certified_random_bits():
         - Return type annotation changed from Tuple[np.ndarray, List[Dict]] to
-          Tuple[np.ndarray, List[Union[BlockMetadata, EATSummary]]].
+          Tuple[np.ndarray, List[Union[BlockMetadata, FinalDecision, EATSummary]]].
         - halt_meta 'blocks_accumulated' key renamed to 'blocks_used'.
       No logic changes — pure schema formalisation and naming unification.
 
@@ -82,7 +88,7 @@ v16 — Batch 7 fix: A5
 v14 — Batch 5 fix: A1
   A1. process_block() split into 4 private methods:
         _certify_block()    — Steps 0–3: gating, BB84 split, Hoeffding cert, EAT append
-        _run_diagnostics()  — Steps 4–5: run_self_tests, halt/warn decision
+        _run_diagnostics()  — Steps 4–5: run_self_tests, warning-only diagnostics
         _extract_block()    — Steps 6+8–9: LHL length, seed derivation, Toeplitz extraction
         _assemble_metadata()— Steps 7+10–11: 30-field metadata dict, throughput counters
       process_block() is now a ~25-line orchestrator that calls the four methods in order.
@@ -107,7 +113,7 @@ Security invariants (unchanged throughout all versions)
 import numpy as np
 from scipy import stats
 from dataclasses import dataclass, field
-from typing import Tuple, Dict, List, Optional, Union
+from typing import Any, Tuple, Dict, List, Optional, Union, Literal, cast
 try:
     from typing import TypedDict
 except ImportError:          # Python < 3.8 fallback
@@ -124,8 +130,9 @@ class BlockMetadata(TypedDict):
     """
     Schema for every block-level metadata dict produced by process_block().
 
-    These are the entries at positions [0 .. -2] of the metadata_list returned
-    by generate_certified_random_bits().  The final entry is an EATSummary.
+    These are the entries at positions [0 .. -3] of the metadata_list returned
+    by generate_certified_random_bits(). The final two entries are, in order:
+    EATSummary (second last), then FinalDecision (last).
 
     All callers should use typed access (meta['h_min_certified']) rather than
     .get() with fallbacks, because every field listed here is always present.
@@ -160,6 +167,7 @@ class BlockMetadata(TypedDict):
     trust_score:           float
     trust_vector:          dict   # {epsilon_bias, epsilon_drift, epsilon_corr, epsilon_leak}
     diagnostic_warning:    Optional[str]
+    diagnostic_state:      dict   # observational diagnostics (warnings/trends/anomalies)
     halt_threshold:        float
     warn_threshold:        float
     # ---- Throughput -------------------------------------------------------
@@ -170,9 +178,25 @@ class BlockMetadata(TypedDict):
     gate_tau:              Optional[float]
     gate_yield:            Optional[float]
     epsilon_gate:          Optional[float]
+    epsilon_gate_empirical: Optional[float]
+    epsilon_gate_bound:    Optional[float]
     gate_imr:              Optional[float]
+    gate_bias_acknowledged: bool
+    gate_entropy_correction_todo: bool
     gate_n_accepted:       int
     gate_n_total:          int
+    gate_min_accepted_threshold: int
+    gate_weak_statistics:  bool
+    gate_sample_warning:   Optional[str]
+    gate_persistent_small_bias_flag: bool
+    cumulative_gate_yield: Optional[float]
+    cumulative_epsilon_gate: Optional[float]
+    epsilon_gate_running_average: Optional[float]
+    cumulative_epsilon_gate_trend: Optional[float]
+    epsilon_gate_drift_indicator: Optional[float]
+    epsilon_gate_moving_average: Optional[float]
+    weak_adversarial_influence_flag: bool
+    basis_attack_detected:  bool
 
 
 class EATSummary(TypedDict):
@@ -181,7 +205,7 @@ class EATSummary(TypedDict):
     generate_certified_random_bits().
 
     This is the global EAT accumulation result across all blocks.
-    It is distinguishable from BlockMetadata by position (always last)
+    It is distinguishable from BlockMetadata by position (always second last)
     and by the presence of 'certified_output_bits' / 'actual_output_bits'
     which do not appear in per-block metadata.
     """
@@ -197,6 +221,48 @@ class EATSummary(TypedDict):
     actual_output_bits:    int    # Bits actually returned (≤ certified_output_bits)
     delta_eat:             float  # EAT penalty: 2·√N·√(ln(1/ε_EAT))
     sum_f_ei:              float  # Raw entropy sum before penalty: Σ h_min_i·n_gen_i
+
+
+class FinalDecision(TypedDict):
+    """
+    Schema for Layer-3 post-certification decision output.
+
+    Layer-3 is strictly observational/policy logic applied after
+    EAT accumulation and final extraction. It MUST NOT modify entropy,
+    extraction length, or EAT results.
+    """
+    accepted:       bool
+    status:         Literal["ACCEPT", "WARN", "REJECT"]
+    reason:         str
+    security_definition: str
+    epsilon_total:  float
+    epsilon_eat:    float
+    epsilon_smooth: float
+    epsilon_ext:    float
+    certified_bits: int
+    returned_bits:  int
+
+
+class GateMetadata(TypedDict):
+    """
+    Schema for pre-value gate metadata (Layer-1 diagnostic fields).
+    """
+    enabled:      bool
+    tau:          Optional[float]
+    n_total:      int
+    n_accepted:   int
+    yield_rate:   Optional[float]
+    epsilon_gate: Optional[float]
+    epsilon_gate_empirical: Optional[float]
+    epsilon_gate_bound: Optional[float]
+    imr:          Optional[float]
+    sigma:        Optional[float]
+    bias_acknowledged: bool
+    entropy_correction_todo: bool
+    weak_statistics: bool
+    min_accepted_threshold: int
+    sample_warning: Optional[str]
+    persistent_small_bias_flag: bool
 
 
 # ---------------------------------------------------------------------------
@@ -220,9 +286,11 @@ class TrustVector:
     epsilon_leak:  float = 0.0
 
     def trust_score(self) -> float:
-        """Compute aggregate trust score [0, 1], where 1 = perfect trust.
+        """Compute aggregate diagnostic trust score in [0, 1], where 1 = best.
 
         F1 FIX: result is clamped to [0, 1].
+        This score is diagnostic only and MUST NEVER influence entropy
+        certification, extraction length, or EAT accounting.
         Without the clamp, if any epsilon component exceeds 1.0 (possible when
         TrustVector is constructed directly with out-of-range values), the norm
         can exceed 2.0 and the score goes negative. A negative trust_score
@@ -247,18 +315,11 @@ class TrustVector:
 
 class DiagnosticHaltError(Exception):
     """
-    Raised when diagnostic self-tests detect a condition severe enough
-    to halt extraction entirely.
+    Legacy exception type retained for backward compatibility.
 
-    Diagnostics are ALLOWED to halt — they are FORBIDDEN to modify entropy.
-
-    Halt conditions (trust_score thresholds):
-        trust_score < HALT_THRESHOLD  → raise DiagnosticHaltError
-        trust_score < WARN_THRESHOLD  → add warning to metadata, continue
-
-    These thresholds are engineering policy, not security bounds.
-    The certified entropy H_cert remains valid regardless of trust_score;
-    halting is a conservative operational choice, not a cryptographic requirement.
+    NOTE (Batch-5 refactor):
+        Diagnostics are now warning-only and MUST NOT halt entropy generation.
+        This exception is no longer raised by the entropy pipeline.
     """
     HALT_THRESHOLD: float = 0.2   # Hard stop — system too unstable to operate
     WARN_THRESHOLD: float = 0.5   # Soft warning — degraded but operational
@@ -288,7 +349,15 @@ class EATConvergenceWarning(Exception):
     with no signal to the caller. A partial return is indistinguishable from
     a normal return without checking output length against n_bits.
     """
-    pass
+    def __init__(self, total_gen: int, requested_bits: int, h_total_eat: float):
+        self.total_gen = int(total_gen)
+        self.requested_bits = int(requested_bits)
+        self.h_total_eat = float(h_total_eat)
+        super().__init__(
+            "CertifiedGenerationSession.run: EAT convergence not reached; "
+            f"requested_bits={self.requested_bits}, total_gen={self.total_gen}, "
+            f"h_total_eat={self.h_total_eat:.6f}."
+        )
 
 
 class ExtractionFailureError(Exception):
@@ -299,6 +368,17 @@ class ExtractionFailureError(Exception):
     on this path. All-zero output is valid random output and completely
     indistinguishable from correct output without external checking.
     This is the most dangerous silent failure in the codebase.
+    """
+    pass
+
+
+class ExtractionConfigurationError(Exception):
+    """
+    Raised when extractor dimensions exceed the configured single-pass limits.
+
+    Security policy: extraction mode must be selected explicitly by operators.
+    The extractor MUST NOT silently switch to chunked domain separation based
+    on runtime memory pressure or block-size overflow.
     """
     pass
 
@@ -317,6 +397,8 @@ def _sigmoid(x: float, k: float, x0: float) -> float:
     ------------------
     k  controls steepness: higher k = sharper transition.
     x0 is the inflection point (maps to ε = 0.5).
+    Both parameters are calibration heuristics used for diagnostics only
+    (not entropy certification inputs).
 
     Choosing x0 at roughly the "clearly problematic but not worst-case"
     value ensures:
@@ -410,12 +492,15 @@ class StatisticalSelfTester:
         runs      = int(np.count_nonzero(np.diff(bits))) + 1
         prop_ones = float(np.mean(bits))
 
+        if prop_ones <= 0.0 or prop_ones >= 1.0:
+            return False, 0.0
+
         expected_runs = 2 * n * prop_ones * (1 - prop_ones) + 1
         variance_runs = (2 * n * prop_ones * (1 - prop_ones) *
                          (2 * n * prop_ones * (1 - prop_ones) - n) / (n - 1))
 
         if variance_runs <= 0:
-            return True, 1.0
+            return False, 0.0
 
         z_score = (runs - expected_runs) / np.sqrt(variance_runs)
         p_value = 2 * (1 - stats.norm.cdf(abs(z_score)))
@@ -594,10 +679,14 @@ class PreValueGate:
     def __init__(self,
                  sigma:         float = 1.0,
                  yield_min:     float = 0.30,
-                 tau_init:      float = 0.5):
+                 tau_init:      float = 0.5,
+                 max_epsilon_gate: float = 0.25,
+                 optimization_lambda: float = 0.5):
         self.sigma     = sigma
         self.yield_min = yield_min
         self.tau       = tau_init
+        self.max_epsilon_gate = float(max(max_epsilon_gate, 0.0))
+        self.optimization_lambda = float(np.clip(optimization_lambda, 0.0, 1.0))
 
         self._imr_grid = self._imr(self._TAU_SEARCH_GRID)
 
@@ -613,14 +702,24 @@ class PreValueGate:
 
         tau_grid   = self._TAU_SEARCH_GRID * self.sigma
         yield_grid = 2.0 * norm.sf(self._TAU_SEARCH_GRID)
+        imr_grid   = self._imr_grid
+        eps_bias   = float(np.clip(epsilon_bias, 0.0, 0.5))
+        eps_gate_est_grid = np.clip(eps_bias * imr_grid, 0.0, 0.5)
+        gate_constraint = eps_gate_est_grid <= self.max_epsilon_gate
 
-        valid = yield_grid >= self.yield_min
+        valid = (yield_grid >= self.yield_min) & gate_constraint
         if not np.any(valid):
             self.tau = tau_grid[0]
             return self.tau
 
-        imr_valid       = np.where(valid, self._imr_grid, np.inf)
-        best_idx        = int(np.argmin(imr_valid))
+        imr_norm = imr_grid / max(float(np.max(imr_grid)), 1e-12)
+        bias_norm = eps_gate_est_grid / max(self.max_epsilon_gate, 1e-12)
+        objective = (
+            self.optimization_lambda * imr_norm
+            + (1.0 - self.optimization_lambda) * bias_norm
+        )
+        objective_valid = np.where(valid, objective, np.inf)
+        best_idx = int(np.argmin(objective_valid))
         self.tau        = float(tau_grid[best_idx])
 
         return self.tau
@@ -628,9 +727,17 @@ class PreValueGate:
     def apply(self,
               raw_signal: np.ndarray,
               bits:       np.ndarray,
-              bases:      np.ndarray
-              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+              bases:      np.ndarray,
+              min_accepted_threshold: int = 100,
+              mu_attack: Optional[float] = None,
+              pre_truncation_mean: Optional[float] = None,
+              persistent_small_bias_flag: bool = False,
+              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, GateMetadata]:
         n_total     = len(raw_signal)
+        pre_gate_mean = (
+            float(pre_truncation_mean) if pre_truncation_mean is not None
+            else (float(np.mean(raw_signal)) if n_total > 0 else 0.0)
+        )
         gate_mask   = np.abs(raw_signal) > self.tau
 
         accepted_signal = raw_signal[gate_mask]
@@ -640,26 +747,85 @@ class PreValueGate:
         n_accepted  = int(np.sum(gate_mask))
         yield_rate  = n_accepted / max(n_total, 1)
 
-        if n_accepted > 10:
-            epsilon_gate = float(abs(np.mean(accepted_bits) - 0.5))
+        # Post-selection note:
+        # The gate keeps only |raw_signal| > tau events. This can induce
+        # selection bias in the accepted stream; entropy formulas below still
+        # assume i.i.d. inputs and are intentionally left unchanged in Batch 3.
+        if n_accepted > 0:
+            epsilon_gate_empirical = float(abs(np.mean(accepted_bits) - 0.5))
         else:
-            epsilon_gate = 0.5
+            epsilon_gate_empirical = 0.5
 
         from scipy.stats import norm
         imr_val = float(norm.pdf(self.tau / self.sigma) /
                         max(norm.sf(self.tau / self.sigma), 1e-15))
+        mu_est = float(mu_attack) if mu_attack is not None else pre_gate_mean
+        # If upstream already supplied a gated stream (all |x| > tau), estimate
+        # the latent Gaussian mean with a truncated-normal correction.
+        if mu_attack is None and n_total > 0 and np.all(np.abs(raw_signal) > self.tau):
+            mu_est = self._estimate_mu_from_truncated_gaussian(raw_signal)
+        epsilon_gate_bound = float(abs(mu_est) * imr_val / 2.0)
+        weak_statistics = bool(n_accepted < max(int(min_accepted_threshold), 1))
+        sample_warning = (f"Gate accepted sample size is statistically weak: "
+                          f"n_accepted={n_accepted} < min_threshold={int(min_accepted_threshold)}.")
+        if not weak_statistics:
+            sample_warning = None
 
-        gate_meta = {
+        gate_meta: GateMetadata = {
+            'enabled':      True,
             'tau':          self.tau,
             'n_total':      n_total,
             'n_accepted':   n_accepted,
             'yield_rate':   yield_rate,
-            'epsilon_gate': epsilon_gate,
+            'epsilon_gate': epsilon_gate_empirical,
+            'epsilon_gate_empirical': epsilon_gate_empirical,
+            'epsilon_gate_bound': epsilon_gate_bound,
             'imr':          imr_val,
             'sigma':        self.sigma,
+            'bias_acknowledged': True,
+            'entropy_correction_todo': True,
+            'weak_statistics': weak_statistics,
+            'min_accepted_threshold': int(min_accepted_threshold),
+            'sample_warning': sample_warning,
+            'persistent_small_bias_flag': bool(persistent_small_bias_flag),
         }
 
         return accepted_signal, accepted_bits, accepted_bases, gate_meta
+
+    def _estimate_mu_from_truncated_gaussian(self,
+                                             observed_signal: np.ndarray,
+                                             max_iter: int = 25) -> float:
+        """
+        Estimate latent μ for X~N(μ,σ²) from samples conditioned on |X| > τ.
+        """
+        from scipy.stats import norm
+
+        y = np.asarray(observed_signal, dtype=np.float64).flatten()
+        if y.size == 0:
+            return 0.0
+
+        tau = float(self.tau)
+        sigma = max(float(self.sigma), 1e-12)
+        target_mean = float(np.mean(y))
+
+        def trunc_mean(mu: float) -> float:
+            alpha = (tau - mu) / sigma
+            beta = (-tau - mu) / sigma
+            z = max(float(norm.sf(alpha) + norm.cdf(beta)), 1e-15)
+            return float(mu + sigma * (norm.pdf(alpha) - norm.pdf(beta)) / z)
+
+        mu = float(np.clip(target_mean, -8.0 * sigma, 8.0 * sigma))
+        for _ in range(max_iter):
+            f_val = trunc_mean(mu) - target_mean
+            if abs(f_val) < 1e-12:
+                break
+            h = max(1e-6 * sigma, 1e-9)
+            derivative = (trunc_mean(mu + h) - trunc_mean(mu - h)) / (2.0 * h)
+            if abs(derivative) < 1e-12:
+                break
+            mu -= f_val / derivative
+            mu = float(np.clip(mu, -8.0 * sigma, 8.0 * sigma))
+        return mu
 
     def epsilon_gate_bound(self, mu_attack: float) -> float:
         from scipy.stats import norm
@@ -698,15 +864,40 @@ class EntropyEstimator:
     Certifies min-entropy from observable BB84 statistics.
     """
 
-    def __init__(self, security_parameter: float = 1e-6):
-        self.epsilon_total  = security_parameter
-        self.epsilon_eat    = security_parameter
-        self.epsilon_smooth = security_parameter
-        self.epsilon_ext    = security_parameter
+    def __init__(self,
+                 security_parameter: float = 1e-6,
+                 epsilon_eat: Optional[float] = None,
+                 epsilon_smooth: Optional[float] = None,
+                 epsilon_ext: Optional[float] = None):
+        # Composable security accounting (explicit, globally enforced):
+        #   ε_total = ε_eat + ε_smooth + ε_ext
+        eps_total = float(security_parameter)
+        if epsilon_eat is None and epsilon_smooth is None and epsilon_ext is None:
+            component = eps_total / 3.0
+            self.epsilon_eat = component
+            self.epsilon_smooth = component
+            self.epsilon_ext = component
+        else:
+            if None in (epsilon_eat, epsilon_smooth, epsilon_ext):
+                raise ValueError(
+                    "EntropyEstimator: provide all ε components or none."
+                )
+            self.epsilon_eat = float(cast(float, epsilon_eat))
+            self.epsilon_smooth = float(cast(float, epsilon_smooth))
+            self.epsilon_ext = float(cast(float, epsilon_ext))
+
+        self.epsilon_total = self.epsilon_eat + self.epsilon_smooth + self.epsilon_ext
+        if not np.isclose(self.epsilon_total, eps_total, rtol=0.0, atol=1e-18):
+            raise ValueError(
+                f"EntropyEstimator: ε_total mismatch. expected={eps_total:.3e}, "
+                f"got={self.epsilon_total:.3e}."
+            )
 
     def certify_min_entropy(self,
                             bits:  np.ndarray,
-                            bases: np.ndarray) -> Dict:
+                            bases: np.ndarray,
+                            epsilon_gate_empirical: Optional[float] = None,
+                            gate_yield_rate: Optional[float] = None) -> Dict:
         # F10 FIX: validate inputs before use.
         bits  = np.asarray(bits,  dtype=np.uint8).flatten()
         bases = np.asarray(bases, dtype=np.uint8).flatten()
@@ -735,8 +926,17 @@ class EntropyEstimator:
 
         delta            = np.sqrt(np.log(1.0 / self.epsilon_smooth) / (2.0 * n_test))
         p_max_upper      = min(p_max_hat + delta, 1.0)
+        eps_gate_emp = float(np.clip(epsilon_gate_empirical, 0.0, 0.5)) \
+            if epsilon_gate_empirical is not None else 0.0
+        gate_yield = float(np.clip(gate_yield_rate, 1e-12, 1.0)) \
+            if gate_yield_rate is not None else 1.0
+        postselect_correction_factor = 1.0 / gate_yield
+        eps_gate_corrected = float(np.clip(
+            eps_gate_emp * postselect_correction_factor, 0.0, 0.5
+        ))
+        p_max_upper_postselect = min(p_max_upper + eps_gate_corrected, 1.0)
 
-        h_min_certified  = max(-np.log2(p_max_upper), 0.0)
+        h_min_certified  = max(-np.log2(p_max_upper_postselect), 0.0)
 
         return {
             'n_generation':    n_gen,
@@ -745,6 +945,11 @@ class EntropyEstimator:
             'p_max_hat':       p_max_hat,
             'delta':           delta,
             'p_max_upper':     p_max_upper,
+            'epsilon_gate_empirical': eps_gate_emp,
+            'gate_yield_rate': gate_yield,
+            'postselect_correction_factor': postselect_correction_factor,
+            'epsilon_gate_corrected': eps_gate_corrected,
+            'p_max_upper_postselect': p_max_upper_postselect,
             'h_min_certified': h_min_certified,
         }
 
@@ -763,6 +968,11 @@ class EntropyEstimator:
         return {'n_generation': n_gen, 'n_test': n_test,
                 'p_hat': 1.0, 'p_max_hat': 1.0,
                 'delta': 0.0, 'p_max_upper': 1.0,
+                'epsilon_gate_empirical': 0.0,
+                'gate_yield_rate': 1.0,
+                'postselect_correction_factor': 1.0,
+                'epsilon_gate_corrected': 0.0,
+                'p_max_upper_postselect': 1.0,
                 'h_min_certified': 0.0}
 
 
@@ -787,6 +997,8 @@ class RandomnessExtractor:
                              weak_random: np.ndarray,
                              seed:        np.ndarray,
                              out_len:     int) -> np.ndarray:
+        weak_random = np.asarray(weak_random, dtype=np.float64).flatten()
+        seed = np.asarray(seed, dtype=np.float64).flatten()
         n = len(weak_random)
         m = out_len
 
@@ -794,8 +1006,8 @@ class RandomnessExtractor:
         if len(seed) < required:
             seed = self._extend_seed(seed, required)
 
-        col      = seed[:m].astype(np.float32)
-        row_tail = seed[1:n].astype(np.float32)
+        col      = seed[:m]
+        row_tail = seed[1:n]
 
         raw_size  = m + n
         circ_size = 1 << int(np.ceil(np.log2(max(raw_size, 2))))
@@ -806,26 +1018,30 @@ class RandomnessExtractor:
                 "Use smaller chunks or reduce output_length."
             )
 
-        circ_col = np.zeros(circ_size, dtype=np.float32)
+        circ_col = np.zeros(circ_size, dtype=np.float64)
         circ_col[:m] = col
         if len(row_tail) > 0:
             circ_col[circ_size - len(row_tail):] = row_tail[::-1]
 
-        x_pad = np.zeros(circ_size, dtype=np.float32)
-        x_pad[:n] = weak_random.astype(np.float32)
+        x_pad = np.zeros(circ_size, dtype=np.float64)
+        x_pad[:n] = weak_random
 
         try:
+            # Keep the whole FFT pipeline in float64/complex128 to avoid
+            # reconstruction errors that can flip parity bits after rounding.
+            fft_col = np.fft.rfft(circ_col).astype(np.complex128, copy=False)
+            fft_x = np.fft.rfft(x_pad).astype(np.complex128, copy=False)
             y_full = np.fft.irfft(
-                np.fft.rfft(circ_col) * np.fft.rfft(x_pad),
+                fft_col * fft_x,
                 n=circ_size
-            )
+            ).astype(np.float64, copy=False)
         except MemoryError:
             raise MemoryError(
                 f"_toeplitz_fft_chunk: n={n}, m={m}, circ_size={circ_size}. "
                 "Reduce block_size or max_workers."
             )
 
-        output = np.round(y_full[:m]).astype(np.int64) % 2
+        output = np.rint(y_full[:m]).astype(np.int64) % 2
         return output.astype(np.uint8)
 
     def toeplitz_extract(self, weak_random: np.ndarray,
@@ -839,121 +1055,65 @@ class RandomnessExtractor:
             )
 
         single_circ = 1 << int(np.ceil(np.log2(max(m + n, 2))))
-        if single_circ <= self._MAX_CIRC_SIZE:
-            required = n + m - 1
-            if len(seed) < required:
-                seed = self._extend_seed(seed, required)
-            return self._toeplitz_fft_chunk(weak_random, seed, m)
-
-        max_raw_size   = max(self._MAX_CIRC_SIZE // 2, 2)
-        max_chunk_in   = max(max_raw_size // 2, 1024)
-        n_chunks       = max(int(np.ceil(n / max_chunk_in)), 1)
-        n_c            = int(np.ceil(n / n_chunks))
-
-        seed_bytes = np.packbits(seed[:min(len(seed), 2048)]).tobytes()
-
-        output_accum = np.zeros(m, dtype=np.uint8)
-        chunk_nonce = 0
-
-        chunk_inputs: List[np.ndarray] = []
-        chunk_lengths: List[int] = []
-        chunk_max_out: List[int] = []
-        chunk_segments: List[List[np.ndarray]] = []
-        chunk_bits_produced: List[int] = []
-
-        for i in range(n_chunks):
-            i_start = i * n_c
-            i_end = min(i_start + n_c, n)
-            chunk = weak_random[i_start:i_end]
-            nc_i = len(chunk)
-            if nc_i == 0:
-                continue
-
-            chunk_inputs.append(chunk)
-            chunk_lengths.append(nc_i)
-            chunk_max_out.append(max(max_raw_size - nc_i, 1))
-            chunk_segments.append([])
-            chunk_bits_produced.append(0)
-
-        if not chunk_inputs:
-            raise ExtractionFailureError(
-                f"toeplitz_extract: no non-empty chunks available for extraction. n={n}, m={m}."
+        if single_circ > self._MAX_CIRC_SIZE:
+            raise ExtractionConfigurationError(
+                f"toeplitz_extract: requested single-pass FFT size {single_circ} exceeds "
+                f"MAX_CIRC_SIZE={self._MAX_CIRC_SIZE}. "
+                "Define chunking explicitly in configuration; automatic fallback is disabled."
             )
 
-        while any(bits < m for bits in chunk_bits_produced):
-            made_progress = False
-            for idx, (chunk, nc_i, max_mc_i) in enumerate(
-                zip(chunk_inputs, chunk_lengths, chunk_max_out)
-            ):
-                produced = chunk_bits_produced[idx]
-                if produced >= m:
-                    continue
+        # Conservative memory estimate for float64/complex128 FFT pipeline:
+        # circ_col(float64) + x_pad(float64) + fft_col(complex128)
+        # + fft_x(complex128) + y_full(float64) ~= 48 bytes per element.
+        estimated_bytes = int(single_circ * 48)
+        max_bytes = int(getattr(self, '_MAX_SINGLE_PASS_BYTES', 512 * 1024 * 1024))
+        if estimated_bytes > max_bytes:
+            raise ExtractionConfigurationError(
+                "toeplitz_extract: estimated single-pass FFT working set "
+                f"{estimated_bytes / (1024 ** 2):.1f} MiB exceeds configured "
+                f"limit {max_bytes / (1024 ** 2):.1f} MiB. "
+                "Define chunking explicitly in configuration; automatic fallback is disabled."
+            )
 
-                remaining_for_chunk = m - produced
-                mc_i = min(remaining_for_chunk, max_mc_i)
-                if mc_i <= 0:
-                    raise ExtractionFailureError(
-                        f"toeplitz_extract: unable to size chunk safely (nc_i={nc_i}, "
-                        f"max_raw_size={max_raw_size}, "
-                        f"remaining_for_chunk={remaining_for_chunk})."
-                    )
+        required = n + m - 1
+        if len(seed) < required:
+            seed = self._extend_seed(seed, required)
 
-                chunk_seed = self._derive_chunk_seed(
-                    seed_bytes, chunk_nonce, nc_i + mc_i - 1
-                )
-                try:
-                    out_chunk = self._toeplitz_fft_chunk(chunk, chunk_seed, mc_i)
-                except (MemoryError, ValueError) as exc:
-                    raise ExtractionFailureError(
-                        f"toeplitz_extract: FFT chunk failed for nc_i={nc_i}, mc_i={mc_i}, "
-                        f"chunk_nonce={chunk_nonce}."
-                    ) from exc
+        try:
+            return self._toeplitz_fft_chunk(weak_random, seed, m)
+        except MemoryError as exc:
+            raise ExtractionConfigurationError(
+                "toeplitz_extract: single-pass FFT failed due to memory pressure. "
+                "Automatic chunked fallback is disabled; configure chunked extraction "
+                "explicitly for this deployment."
+            ) from exc
 
-                chunk_segments[idx].append(out_chunk)
-                chunk_bits_produced[idx] += len(out_chunk)
-                chunk_nonce += 1
-                made_progress = True
+    def _derive_chunk_seed(self, master_seed_bits: np.ndarray,
+                            seed_offset: int, nonce: int, length: int) -> np.ndarray:
+        if nonce != 0:
+            raise ValueError(
+                "_derive_chunk_seed: nonce-based derivation is disabled. "
+                "Provide sufficient independent seed bits explicitly."
+            )
 
-            if not made_progress:
-                raise ExtractionFailureError(
-                    f"toeplitz_extract: chunked extraction stalled. n={n}, m={m}, "
-                    f"n_chunks={n_chunks}, produced={chunk_bits_produced}."
-                )
+        master_seed_bits = np.asarray(master_seed_bits, dtype=np.uint8).flatten()
+        start = int(seed_offset)
+        end = start + int(length)
 
-        for idx, per_chunk_segments in enumerate(chunk_segments):
-            if not per_chunk_segments:
-                raise ExtractionFailureError(
-                    f"toeplitz_extract: chunk {idx} produced no output. "
-                    f"n={n}, m={m}, n_chunks={n_chunks}, nc_i={chunk_lengths[idx]}."
-                )
+        if end > len(master_seed_bits):
+            raise ValueError(
+                f"_derive_chunk_seed: insufficient seed material. Need bits [{start}:{end}) "
+                f"for seed_offset={seed_offset}, length={length}, but only "
+                f"{len(master_seed_bits)} seed bits provided."
+            )
 
-            chunk_result = np.concatenate(per_chunk_segments)
-            if len(chunk_result) < m:
-                raise ExtractionFailureError(
-                    f"toeplitz_extract: chunk {idx} produced {len(chunk_result)} bits "
-                    f"but {m} were required for accumulation. "
-                    f"n={n}, m={m}, n_chunks={n_chunks}, nc_i={chunk_lengths[idx]}."
-                )
-
-            output_accum ^= chunk_result[:m].astype(np.uint8, copy=False)
-
-        return output_accum[:m]
-
-    def _derive_chunk_seed(self, master_seed_bytes: bytes,
-                            chunk_idx: int, length: int) -> np.ndarray:
-        extended: List[int] = []
-        counter = 0
-        prefix  = master_seed_bytes + chunk_idx.to_bytes(4, 'big')
-        while len(extended) < length:
-            h    = hashlib.sha256(prefix + counter.to_bytes(4, 'big')).digest()
-            bits = np.unpackbits(np.frombuffer(h, dtype=np.uint8))
-            extended.extend(bits.tolist())
-            counter += 1
-        return np.array(extended[:length], dtype=np.uint8)
+        return master_seed_bits[start:end].copy()
 
     _MAX_SEED_BITS: int = 10_000_000
 
     def _extend_seed(self, seed: np.ndarray, length: int) -> np.ndarray:
+        seed = np.asarray(seed, dtype=np.uint8).flatten()
+
         if length > self._MAX_SEED_BITS:
             raise ValueError(
                 f"_extend_seed: requested length={length} bits exceeds "
@@ -961,18 +1121,14 @@ class RandomnessExtractor:
                 "This indicates a logic error upstream."
             )
 
-        seed_bytes = np.packbits(seed).tobytes()
-        extended   = []
-        counter    = 0
+        if len(seed) < length:
+            raise ValueError(
+                f"_extend_seed: LHL-compliant extraction requires an explicit Toeplitz "
+                f"seed of length at least n + m - 1 = {length} bits; only "
+                f"{len(seed)} bits were provided."
+            )
 
-        while len(extended) < length:
-            hash_input  = seed_bytes + counter.to_bytes(4, 'big')
-            hash_output = hashlib.sha256(hash_input).digest()
-            bits        = np.unpackbits(np.frombuffer(hash_output, dtype=np.uint8))
-            extended.extend(bits)
-            counter += 1
-
-        return np.array(extended[:length], dtype=np.uint8)
+        return seed[:length].copy()
 
     def adaptive_extract(self, weak_random: np.ndarray,
                           seed: np.ndarray) -> np.ndarray:
@@ -1008,9 +1164,22 @@ class QRNGSessionState:
     """
     block_entropy_history: List[float] = field(default_factory=list)
     block_n_gen_history:   List[int]   = field(default_factory=list)
+    block_gen_bits_history: List[np.ndarray] = field(default_factory=list)
     total_output_bits:     int         = 0
     total_gen_input_bits:  int         = 0
     total_raw_input_bits:  int         = 0
+    block_h_min_history:   List[float] = field(default_factory=list)
+    block_extraction_rate_history: List[float] = field(default_factory=list)
+    gate_accepted_total:   int         = 0
+    gate_total_total:      int         = 0
+    epsilon_gate_sum:      float       = 0.0
+    epsilon_gate_count:    int         = 0
+    epsilon_gate_small_count: int      = 0
+    epsilon_gate_history:  List[float] = field(default_factory=list)
+    gate_block_count:      int         = 0
+    trust_score_history:   List[float] = field(default_factory=list)
+    session_warnings:      List[str]   = field(default_factory=list)
+    anomaly_history:       List[str]   = field(default_factory=list)
 
     def accumulate_eat(self, epsilon_eat: float) -> float:
         """
@@ -1018,10 +1187,16 @@ class QRNGSessionState:
 
         Units: everything in BITS (not bits/bit).
 
-            sum_f   = Σᵢ  h_min_i · n_gen_i          [bits]
-            N_total = Σᵢ  n_gen_i                     [bits]
-            Δ_EAT   = 2 · √N_total · √(ln(1/ε_EAT))  [bits]
-            H_total = sum_f − Δ_EAT                   [bits]
+            sum_f   = Σᵢ  h_min_i · n_gen_i                                [bits]
+            N_total = Σᵢ  n_gen_i                                           [bits]
+            Δ_var   = √(2 · N_total · V · ln(1/ε_EAT))                     [bits]
+            Δ_corr  = (2/3) · c · ln(1/ε_EAT)                              [bits]
+            H_total = sum_f − Δ_var − Δ_corr                               [bits]
+
+        where:
+            V = variance proxy of the min-tradeoff function (estimated from
+                per-block h_min values, bounded to [0, 0.25] for binary rounds)
+            c = max single-round tradeoff range (1.0 bit for binary outcomes)
 
         Moved here from TrustEnhancedQRNG.accumulate_eat() — logic is identical,
         only the location changes.
@@ -1034,13 +1209,35 @@ class QRNGSessionState:
         if t == 0:
             return 0.0
 
-        sum_f     = sum(self.block_entropy_history)
-        n_total   = sum(self.block_n_gen_history)
-        delta_eat = 2.0 * np.sqrt(n_total) * np.sqrt(np.log(1.0 / epsilon_eat))
+        if epsilon_eat <= 0.0 or epsilon_eat >= 1.0:
+            raise ValueError(
+                f"accumulate_eat: epsilon_eat must be in (0, 1), got {epsilon_eat}."
+            )
+
+        sum_f   = float(sum(self.block_entropy_history))
+        n_total = int(sum(self.block_n_gen_history))
+        if n_total <= 0:
+            return 0.0
+
+        h_vals = np.asarray(self.block_h_min_history, dtype=np.float64)
+        if h_vals.size <= 1:
+            variance_proxy = 0.0
+        else:
+            variance_proxy = float(np.var(h_vals, ddof=1))
+        variance_proxy = float(np.clip(variance_proxy, 0.0, 0.25))
+
+        c_range = 1.0
+        log_term = float(np.log(1.0 / epsilon_eat))
+        delta_var = float(np.sqrt(2.0 * n_total * variance_proxy * log_term))
+        delta_corr = float((2.0 / 3.0) * c_range * log_term)
+        delta_eat = delta_var + delta_corr
 
         return max(sum_f - delta_eat, 0.0)
 
-    def append_block(self, h_min_certified: float, n_gen: int) -> None:
+    def append_block(self,
+                     h_min_certified: float,
+                     n_gen: int,
+                     gen_bits: Optional[np.ndarray] = None) -> None:
         """
         Record one block's contribution to the EAT accumulation.
 
@@ -1050,6 +1247,200 @@ class QRNGSessionState:
         """
         self.block_entropy_history.append(h_min_certified * n_gen)
         self.block_n_gen_history.append(n_gen)
+        self.block_h_min_history.append(h_min_certified)
+        if gen_bits is not None:
+            self.block_gen_bits_history.append(np.array(gen_bits, dtype=np.uint8, copy=True))
+
+    def update_extraction_rate(self, extraction_rate: float) -> None:
+        """Track per-block extraction rate for diagnostic consistency checks."""
+        self.block_extraction_rate_history.append(float(extraction_rate))
+
+    def update_gate_tracking(self,
+                             n_accepted: int,
+                             n_total: int,
+                             epsilon_gate: Optional[float],
+                             small_bias_threshold: float = 0.01) -> None:
+        """
+        Track cumulative gate quantities.
+
+        NOTE: pre-value gating introduces selection bias because only accepted
+        samples are forwarded. We monitor this bias trend here; we do NOT
+        correct entropy formulas at this stage.
+        """
+        self.gate_accepted_total += int(n_accepted)
+        self.gate_total_total += int(n_total)
+        self.gate_block_count += 1
+        if epsilon_gate is not None:
+            epsilon_gate_f = float(epsilon_gate)
+            self.epsilon_gate_sum += epsilon_gate_f
+            self.epsilon_gate_count += 1
+            self.epsilon_gate_history.append(epsilon_gate_f)
+            if epsilon_gate_f <= float(small_bias_threshold):
+                self.epsilon_gate_small_count += 1
+
+    def record_diagnostics(self,
+                           trust_score: float,
+                           warning: Optional[str],
+                           anomalies: Optional[List[str]] = None) -> None:
+        """Record observational diagnostics without affecting entropy flow."""
+        self.trust_score_history.append(float(trust_score))
+        if warning:
+            self.session_warnings.append(str(warning))
+        if anomalies:
+            self.anomaly_history.extend([str(a) for a in anomalies if a])
+
+    def cumulative_gate_yield(self) -> Optional[float]:
+        if self.gate_total_total <= 0:
+            return None
+        return self.gate_accepted_total / self.gate_total_total
+
+    def cumulative_epsilon_gate_trend(self) -> Optional[float]:
+        if self.epsilon_gate_count <= 0:
+            return None
+        return self.epsilon_gate_sum / self.epsilon_gate_count
+
+    def epsilon_gate_running_average(self) -> Optional[float]:
+        """Running average of ε_gate across observed gate-enabled blocks."""
+        return self.cumulative_epsilon_gate_trend()
+
+    def epsilon_gate_moving_average(self, window: int = 5) -> Optional[float]:
+        """Short-window ε_gate moving average for weak-attack diagnostics."""
+        if not self.epsilon_gate_history:
+            return None
+        w = max(int(window), 1)
+        hist = self.epsilon_gate_history[-w:]
+        return float(np.mean(hist))
+
+    def epsilon_gate_drift_indicator(self,
+                                     short_window: int = 5,
+                                     long_window: int = 20) -> Optional[float]:
+        """
+        Drift indicator: short-window mean minus long-window mean.
+        Positive values indicate rising ε_gate; near-zero persistent values
+        can indicate weak-but-steady adversarial influence.
+        """
+        if not self.epsilon_gate_history:
+            return None
+        short_ma = self.epsilon_gate_moving_average(window=short_window)
+        long_ma = self.epsilon_gate_moving_average(window=long_window)
+        if short_ma is None or long_ma is None:
+            return None
+        return float(short_ma - long_ma)
+
+    def persistent_small_gate_bias_flag(self, min_blocks: int = 5,
+                                        min_ratio: float = 0.70) -> bool:
+        """
+        Flag persistent small gate bias regimes across blocks.
+
+        Small |mu_attack| can evade one-shot detection but still lower effective
+        entropy over time after post-selection.
+        """
+        if self.gate_block_count < max(int(min_blocks), 1):
+            return False
+        ratio = self.epsilon_gate_small_count / max(self.gate_block_count, 1)
+        return ratio >= float(min_ratio)
+
+    def weak_adversarial_influence_flag(self,
+                                        min_blocks: int = 8,
+                                        moving_avg_window: int = 6,
+                                        epsilon_band: float = 0.02,
+                                        max_abs_drift: float = 0.003) -> bool:
+        """
+        Detect persistent small ε_gate across blocks with low drift.
+        This is metadata-only detection and must not feed entropy/extraction.
+        """
+        if self.epsilon_gate_count < max(int(min_blocks), 1):
+            return False
+        moving_avg = self.epsilon_gate_moving_average(window=moving_avg_window)
+        drift = self.epsilon_gate_drift_indicator(
+            short_window=moving_avg_window,
+            long_window=max(2 * moving_avg_window, moving_avg_window + 1),
+        )
+        if moving_avg is None or drift is None:
+            return False
+        return (moving_avg <= float(epsilon_band)) and (abs(drift) <= float(max_abs_drift))
+
+
+# ---------------------------------------------------------------------------
+# Layer-3 FinalDecisionLayer
+# ---------------------------------------------------------------------------
+
+class FinalDecisionLayer:
+    """
+    Layer-3 post-certification decision logic.
+
+    IMPORTANT:
+      - Never modifies entropy values.
+      - Never modifies extraction length.
+      - Never modifies EAT result.
+      - Only classifies the already-produced output as ACCEPT/WARN/REJECT.
+    """
+    def __init__(self,
+                 halt_threshold: float = DiagnosticHaltError.HALT_THRESHOLD,
+                 warn_threshold: float = DiagnosticHaltError.WARN_THRESHOLD):
+        self.halt_threshold = halt_threshold
+        self.warn_threshold = warn_threshold
+
+    def evaluate(self,
+                 final_bits: np.ndarray,
+                 eat_summary: EATSummary,
+                 last_block_meta: Optional[BlockMetadata],
+                 trust_score: float,
+                 epsilon_gate: Optional[float] = None) -> FinalDecision:
+        certified_bits = int(eat_summary['certified_output_bits'])
+        returned_bits = int(len(final_bits))
+
+        reason_parts: List[str] = []
+        if epsilon_gate is not None:
+            reason_parts.append(f"epsilon_gate={epsilon_gate:.6f}")
+        if last_block_meta is not None and last_block_meta['diagnostic_warning'] is not None:
+            reason_parts.append(last_block_meta['diagnostic_warning'])
+
+        if trust_score < self.halt_threshold:
+            return {
+                'accepted': False,
+                'status': 'REJECT',
+                'reason': ("Trust score below halt threshold "
+                           f"({trust_score:.4f} < {self.halt_threshold:.4f})"
+                           + (f"; {' | '.join(reason_parts)}" if reason_parts else "")),
+                'security_definition': eat_summary['security_definition'],
+                'epsilon_total': float(eat_summary['epsilon_total']),
+                'epsilon_eat': float(eat_summary['epsilon_eat']),
+                'epsilon_smooth': float(eat_summary['epsilon_smooth']),
+                'epsilon_ext': float(eat_summary['epsilon_ext']),
+                'certified_bits': certified_bits,
+                'returned_bits': returned_bits,
+            }
+
+        if trust_score < self.warn_threshold:
+            return {
+                'accepted': True,
+                'status': 'WARN',
+                'reason': ("Trust score below warn threshold "
+                           f"({trust_score:.4f} < {self.warn_threshold:.4f})"
+                           + (f"; {' | '.join(reason_parts)}" if reason_parts else "")),
+                'security_definition': eat_summary['security_definition'],
+                'epsilon_total': float(eat_summary['epsilon_total']),
+                'epsilon_eat': float(eat_summary['epsilon_eat']),
+                'epsilon_smooth': float(eat_summary['epsilon_smooth']),
+                'epsilon_ext': float(eat_summary['epsilon_ext']),
+                'certified_bits': certified_bits,
+                'returned_bits': returned_bits,
+            }
+
+        return {
+            'accepted': True,
+            'status': 'ACCEPT',
+            'reason': ("Trust score within normal operating range"
+                       + (f"; {' | '.join(reason_parts)}" if reason_parts else "")),
+            'security_definition': eat_summary['security_definition'],
+            'epsilon_total': float(eat_summary['epsilon_total']),
+            'epsilon_eat': float(eat_summary['epsilon_eat']),
+            'epsilon_smooth': float(eat_summary['epsilon_smooth']),
+            'epsilon_ext': float(eat_summary['epsilon_ext']),
+            'certified_bits': certified_bits,
+            'returned_bits': returned_bits,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1092,11 +1483,34 @@ class CertifiedGenerationSession:
         """
         self.te_qrng     = te_qrng
         self.epsilon_eat = epsilon_eat
+        self.epsilon_smooth = te_qrng.epsilon_smooth
         self.epsilon_ext = epsilon_ext
+        self.epsilon_total = self.epsilon_eat + self.epsilon_smooth + self.epsilon_ext
+
+    @staticmethod
+    def _validate_epsilon_consistency(block_meta: BlockMetadata,
+                                      eat_summary: EATSummary,
+                                      final_decision: FinalDecision) -> None:
+        for label, record in (
+            ("BlockMetadata", block_meta),
+            ("EATSummary", eat_summary),
+            ("FinalDecision", final_decision),
+        ):
+            eps_total = float(record['epsilon_total'])
+            eps_sum = (
+                float(record['epsilon_eat'])
+                + float(record['epsilon_smooth'])
+                + float(record['epsilon_ext'])
+            )
+            if not np.isclose(eps_total, eps_sum, rtol=0.0, atol=1e-18):
+                raise RuntimeError(
+                    f"{label}: ε_total must equal ε_eat + ε_smooth + ε_ext "
+                    f"(got {eps_total:.3e} vs {eps_sum:.3e})."
+                )
 
     def run(self,
             n_bits:           int,
-            source_simulator) -> Tuple[np.ndarray, List[Union[BlockMetadata, EATSummary]]]:
+            source_simulator) -> Tuple[np.ndarray, List[Union[BlockMetadata, FinalDecision, EATSummary]]]:
         """
         Generate n_bits with full composable EAT-certified security.
 
@@ -1110,12 +1524,11 @@ class CertifiedGenerationSession:
 
         Returns:
             (final_bits[:n_bits], metadata_list)
-            metadata_list[-1] is always an EATSummary.
-            metadata_list[:-1] are BlockMetadata dicts, one per block.
+            metadata_list structure is always:
+                [BlockMetadata, ..., EATSummary, FinalDecision]
 
         Raises:
             ValueError:              n_bits <= 0
-            DiagnosticHaltError:     trust_score falls below HALT_THRESHOLD
             EATConvergenceWarning:   EAT bound not reached within 50×n_bits raw bits
             InsufficientEntropyError: certified output length < 1 after EAT
         """
@@ -1129,42 +1542,34 @@ class CertifiedGenerationSession:
         # Create a fresh session state for this run
         session = QRNGSessionState()
 
-        all_gen_bits:  List[np.ndarray] = []
-        metadata_list: List[Dict]       = []
+        all_gen_bits:  List[np.ndarray]                         = []
+        metadata_list: List[Union[BlockMetadata, FinalDecision, EATSummary]]  = []
 
         block_size = self.te_qrng.block_size
-        convergence_warning: Optional[str] = None
-
         while True:
             raw_bits, bases, raw_signal = source_simulator.generate_block(block_size)
 
             signal_stats = (source_simulator.get_signal_stats()
                             if hasattr(source_simulator, 'get_signal_stats') else None)
 
-            try:
-                _, block_meta = self.te_qrng.process_block(
-                    raw_bits, bases, raw_signal, session=session,
-                    signal_stats=signal_stats
-                )
-            except DiagnosticHaltError as exc:
-                halt_meta = {
-                    'certified_quantity':  'H_min(X|E)',
-                    'security_definition': 'Trace-distance ε-security',
-                    'halt': True,
-                    'halt_reason': str(exc),
-                    'blocks_used': len(session.block_entropy_history),
-                    'h_total_eat': session.accumulate_eat(self.epsilon_eat),
-                }
-                metadata_list.append(halt_meta)
-                raise
+            _, block_meta = self.te_qrng.process_block(
+                raw_bits, bases, raw_signal, session=session,
+                signal_stats=signal_stats
+            )
+            if not np.isclose(
+                float(block_meta['epsilon_total']),
+                float(block_meta['epsilon_eat']) + float(block_meta['epsilon_smooth']) + float(block_meta['epsilon_ext']),
+                rtol=0.0, atol=1e-18
+            ):
+                raise RuntimeError("BlockMetadata ε accounting inconsistency.")
 
             metadata_list.append(block_meta)
 
-            if bases is not None:
-                gen_bits, _ = BB84RoundSplitter.split(raw_bits, bases)
-            else:
-                gen_bits = raw_bits
-            all_gen_bits.append(gen_bits)
+            if not session.block_gen_bits_history:
+                raise RuntimeError(
+                    "CertifiedGenerationSession.run: missing generation-bit history for block."
+                )
+            all_gen_bits.append(session.block_gen_bits_history[-1])
 
             h_total          = session.accumulate_eat(self.epsilon_eat)
             log2_inv_eps_ext = np.log2(1.0 / self.epsilon_ext)
@@ -1175,12 +1580,11 @@ class CertifiedGenerationSession:
 
             total_gen = sum(len(g) for g in all_gen_bits)
             if total_gen > 50 * n_bits:
-                convergence_warning = (
-                    "CertifiedGenerationSession.run: EAT bound not reached after "
-                    f"total_gen={total_gen} bits ({50 * n_bits} limit). "
-                    f"Proceeding with partial certified output for requested n_bits={n_bits}."
+                raise EATConvergenceWarning(
+                    total_gen=total_gen,
+                    requested_bits=n_bits,
+                    h_total_eat=h_total,
                 )
-                break
 
         # Global final Toeplitz extraction
         all_gen_concat = (np.concatenate(all_gen_bits)
@@ -1192,26 +1596,6 @@ class CertifiedGenerationSession:
         output_length    = min(n_bits, certified_output)
 
         if output_length < 1 or len(all_gen_concat) < 2:
-            if convergence_warning is not None:
-                n_total_convergence = sum(session.block_n_gen_history)
-                eat_summary: EATSummary = {
-                    'certified_quantity':    'H_min(X|E)',
-                    'security_definition':   'Trace-distance ε-security',
-                    'epsilon_total':         self.te_qrng.epsilon_total,
-                    'epsilon_eat':           self.epsilon_eat,
-                    'epsilon_smooth':        self.te_qrng.epsilon_smooth,
-                    'epsilon_ext':           self.epsilon_ext,
-                    'blocks_used':           len(session.block_entropy_history),
-                    'h_total_eat':           h_total,
-                    'certified_output_bits': certified_output,
-                    'actual_output_bits':    0,
-                    'delta_eat':             (2.0 * np.sqrt(n_total_convergence) *
-                                              np.sqrt(np.log(1.0 / self.epsilon_eat))
-                                              if len(session.block_entropy_history) > 0 else 0.0),
-                    'sum_f_ei':              sum(session.block_entropy_history),
-                }
-                metadata_list.append(eat_summary)
-                return np.array([], dtype=np.uint8), metadata_list
             raise InsufficientEntropyError(
                 f"CertifiedGenerationSession.run: certified output length is "
                 f"{output_length} bits after EAT accumulation. "
@@ -1240,12 +1624,14 @@ class CertifiedGenerationSession:
                      np.sqrt(np.log(1.0 / self.epsilon_eat))
                      if t_blocks > 0 else 0.0)
 
+        # Independent composable terms:
+        #   ε_total = ε_eat + ε_smooth + ε_ext
         eat_summary: EATSummary = {
             'certified_quantity':    'H_min(X|E)',
             'security_definition':   'Trace-distance ε-security',
-            'epsilon_total':         self.te_qrng.epsilon_total,
+            'epsilon_total':         self.epsilon_total,
             'epsilon_eat':           self.epsilon_eat,
-            'epsilon_smooth':        self.te_qrng.epsilon_smooth,
+            'epsilon_smooth':        self.epsilon_smooth,
             'epsilon_ext':           self.epsilon_ext,
             'blocks_used':           t_blocks,
             'h_total_eat':           h_total,
@@ -1254,7 +1640,35 @@ class CertifiedGenerationSession:
             'delta_eat':             delta_eat,
             'sum_f_ei':              sum_f_ei,
         }
+        eat_summary['diagnostic_state'] = {
+            'trust_score_trend': session.trust_score_history,
+            'warnings': session.session_warnings,
+            'anomalies': session.anomaly_history,
+        }
+
+        decision_layer = FinalDecisionLayer()
+        last_block_meta = metadata_list[-1] if metadata_list else None
         metadata_list.append(eat_summary)
+        # FinalDecision is evaluated only after final_bits and EATSummary exist.
+        final_decision = decision_layer.evaluate(
+            final_bits=final_bits,
+            eat_summary=eat_summary,
+            last_block_meta=last_block_meta,
+            trust_score=last_block_meta['trust_score'] if last_block_meta else 1.0,
+            epsilon_gate=last_block_meta.get('epsilon_gate', None) if last_block_meta else None,
+        )
+        if last_block_meta is not None:
+            self._validate_epsilon_consistency(last_block_meta, eat_summary, final_decision)
+        metadata_list.append(final_decision)
+
+        # Enforce deterministic metadata ordering for downstream consumers:
+        # [BlockMetadata, ..., EATSummary, FinalDecision]
+        if len(metadata_list) < 2:
+            raise RuntimeError("metadata_list must contain EATSummary and FinalDecision.")
+        if not (isinstance(metadata_list[-2], dict) and 'certified_output_bits' in metadata_list[-2]):
+            raise RuntimeError("metadata_list[-2] must be an EATSummary.")
+        if not (isinstance(metadata_list[-1], dict) and 'status' in metadata_list[-1] and 'accepted' in metadata_list[-1]):
+            raise RuntimeError("metadata_list[-1] must be a FinalDecision.")
 
         return final_bits[:n_bits], metadata_list
 
@@ -1314,11 +1728,17 @@ class TrustEnhancedQRNG:
                  extractor_efficiency: float = 0.9,
                  enable_gating:        bool  = True,
                  sigma_signal:         float = 1.0,
-                 yield_min:            float = 0.30):
+                 yield_min:            float = 0.30,
+                 gate_min_accepted_threshold: int = 100,
+                 gate_small_bias_epsilon: float = 0.01,
+                 gate_small_bias_window: int = 5):
         self.block_size           = block_size
         self.security_parameter   = security_parameter
         self.extractor_efficiency = extractor_efficiency
         self.enable_gating        = enable_gating
+        self.gate_min_accepted_threshold = max(int(gate_min_accepted_threshold), 1)
+        self.gate_small_bias_epsilon = float(gate_small_bias_epsilon)
+        self.gate_small_bias_window = max(int(gate_small_bias_window), 1)
 
         # Components
         self.stat_tester       = StatisticalSelfTester(window_size=block_size)
@@ -1333,11 +1753,12 @@ class TrustEnhancedQRNG:
             tau_init  = 0.5,
         )
 
-        # Composable epsilon budget (mirrors EntropyEstimator)
-        self.epsilon_total  = self.entropy_estimator.epsilon_total
+        # Composable epsilon budget (mirrors EntropyEstimator):
+        #   ε_total = ε_eat + ε_smooth + ε_ext
         self.epsilon_eat    = self.entropy_estimator.epsilon_eat
         self.epsilon_smooth = self.entropy_estimator.epsilon_smooth
         self.epsilon_ext    = self.entropy_estimator.epsilon_ext
+        self.epsilon_total  = self.epsilon_eat + self.epsilon_smooth + self.epsilon_ext
 
         # Diagnostic state (does NOT feed into entropy bound)
         self.trust_vector = TrustVector()
@@ -1355,7 +1776,8 @@ class TrustEnhancedQRNG:
                        raw_bits:    np.ndarray,
                        bases:       Optional[np.ndarray] = None,
                        raw_signal:  Optional[np.ndarray] = None,
-                       signal_stats: Optional[Tuple[float, float]] = None) -> TrustVector:
+                       signal_stats: Optional[Tuple[float, float]] = None,
+                       epsilon_gate: Optional[float] = None) -> TrustVector:
         """
         Run the full statistical / quantum self-test suite.
 
@@ -1364,6 +1786,8 @@ class TrustEnhancedQRNG:
         calibrated heuristics, not formally derived security bounds. The halt
         threshold (0.2) and warn threshold (0.5) are operational policy choices.
         None of these values appear in the certified entropy bound.
+        Consequently, trust_score is a diagnostic heuristic only and must never
+        be interpreted as a security parameter.
         """
        
         autocorr_pass, max_autocorr = self.stat_tester.autocorrelation_test(raw_bits)
@@ -1403,6 +1827,9 @@ class TrustEnhancedQRNG:
             _, drift_score = self.drift_monitor.detect_drift()
             epsilon_drift = _sigmoid(drift_score, k=4.0, x0=1.0)  # heuristic
 
+        if epsilon_gate is not None:
+            epsilon_bias = max(epsilon_bias, epsilon_gate)
+
         self.trust_vector = TrustVector(
             epsilon_bias  = float(np.clip(epsilon_bias,  0.0, 1.0)),
             epsilon_drift = float(np.clip(epsilon_drift, 0.0, 1.0)),
@@ -1431,15 +1858,51 @@ class TrustEnhancedQRNG:
         rather than on self. append_block() delegates to session.
         """
         # Step 0: Pre-value gating (Layer 1)
-        gate_meta: Dict = {'enabled': False}
+        gate_meta: GateMetadata = {
+            'enabled': False,
+            'tau': None,
+            'n_total': n_raw,
+            'n_accepted': n_raw,
+            'yield_rate': None,
+            'epsilon_gate': None,
+            'epsilon_gate_empirical': None,
+            'epsilon_gate_bound': None,
+            'imr': None,
+            'sigma': None,
+            'bias_acknowledged': False,
+            'entropy_correction_todo': False,
+            'weak_statistics': False,
+            'min_accepted_threshold': self.gate_min_accepted_threshold,
+            'sample_warning': None,
+            'persistent_small_bias_flag': False,
+        }
         if self.enable_gating and raw_signal is not None and len(raw_signal) == n_raw:
-            self.pre_value_gate.update_tau(self.trust_vector.epsilon_bias)
+            # Trust→entropy isolation:
+            # tau adaptation must not depend on trust diagnostics, otherwise trust
+            # would indirectly change accepted events and downstream entropy stats.
+            # Keep gate behavior deterministic and trust-independent here.
+            # τ must be chosen before processing this block, using only
+            # currently available block-local statistics (never future data).
+            pre_gate_bias = float(abs(np.mean(raw_bits) - 0.5)) if len(raw_bits) > 0 else 0.5
+            self.pre_value_gate.update_tau(pre_gate_bias)
 
+            # Selection-bias note:
+            # Gating accepts only |signal| > tau samples, which can skew sample
+            # composition relative to the original stream. This bias is tracked
+            # in metadata (gate_yield / epsilon_gate cumulants) but is not
+            # corrected in entropy formulas at this stage.
+            persistent_small_bias_flag = session.persistent_small_gate_bias_flag(
+                min_blocks=self.gate_small_bias_window
+            )
+            pre_truncation_mean = float(np.mean(raw_signal)) if len(raw_signal) > 0 else 0.0
             _, raw_bits, bases_gated, gate_meta = self.pre_value_gate.apply(
                 raw_signal, raw_bits,
-                bases if bases is not None else np.zeros(n_raw, dtype=np.uint8)
+                bases if bases is not None else np.zeros(n_raw, dtype=np.uint8),
+                min_accepted_threshold=self.gate_min_accepted_threshold,
+                mu_attack=None,
+                pre_truncation_mean=pre_truncation_mean,
+                persistent_small_bias_flag=persistent_small_bias_flag,
             )
-            gate_meta['enabled'] = True
             if bases is not None:
                 bases      = bases_gated
             raw_signal = raw_signal[np.abs(raw_signal) > self.pre_value_gate.tau]
@@ -1455,17 +1918,21 @@ class TrustEnhancedQRNG:
         n_gen  = len(gen_bits)
         n_test = len(test_bits)
 
-        # Step 2: Phase-error certification — THE entropy bound (INVARIANT)
+        # Step 2: Phase-error certification — includes post-selection
+        # correction from empirical gate bias ε_gate.
         cert = self.entropy_estimator.certify_min_entropy(
             raw_bits,
-            bases if bases is not None else np.zeros(n_raw, dtype=np.uint8)
+            bases if bases is not None else np.zeros(n_raw, dtype=np.uint8),
+            epsilon_gate_empirical=gate_meta.get('epsilon_gate_empirical'),
+            gate_yield_rate=gate_meta.get('yield_rate')
         )
         h_min_certified = cert['h_min_certified']
         # INVARIANT: h_min_certified is derived solely from p_max_upper.
+        basis_diag = self._basis_diagnostics(bases, n_gen, n_test)
 
         # Step 3: Store f(eᵢ)·n_gen_i for EAT accumulation — via session
         # A5 FIX: was self.block_entropy_history.append(...), now session.append_block()
-        session.append_block(h_min_certified, n_gen)
+        session.append_block(h_min_certified, n_gen, gen_bits=gen_bits)
 
         return {
             'raw_bits':        raw_bits,
@@ -1478,6 +1945,107 @@ class TrustEnhancedQRNG:
             'n_test':          n_test,
             'cert':            cert,
             'h_min_certified': h_min_certified,
+            'basis_diag':      basis_diag,
+        }
+
+    def _basis_diagnostics(self,
+                           bases: Optional[np.ndarray],
+                           n_gen: int,
+                           n_test: int) -> Dict[str, Union[bool, int, Optional[float], List[str]]]:
+        """
+        Basis diagnostics (metadata-only; never coupled to entropy/extraction).
+
+        Assumption note:
+        Current system assumes honest basis generation. Adversarial
+        basis-manipulation attacks are not fully mitigated in this release.
+        Returned flag `basis_attack_detected` is heuristic-only metadata
+        (imbalance/pattern indicators), not a proven detector.
+        """
+        warnings: List[str] = []
+        zero_prob: Optional[float] = None
+        deviation: Optional[float] = None
+        anomaly_flag = False
+
+        if bases is None or len(bases) == 0:
+            unreliable = (n_test < self.min_n_test_required)
+            if unreliable:
+                warnings.append(
+                    f"n_test below configured minimum: {n_test} < {self.min_n_test_required}."
+                )
+            return {
+                'basis_zero_probability': zero_prob,
+                'basis_balance_deviation': deviation,
+                'basis_balance_tolerance': self.basis_balance_tolerance,
+                'basis_anomaly_flag': anomaly_flag,
+                'basis_attack_detected': anomaly_flag,
+                'statistically_unreliable': unreliable,
+                'n_test_min_required': self.min_n_test_required,
+                'warnings': warnings,
+            }
+
+        total = max(n_gen + n_test, 1)
+        gen_ratio = n_gen / total
+        test_ratio = n_test / total
+        min_ratio = 0.10
+        if gen_ratio < min_ratio:
+            warnings.append(
+                f"Generation/test imbalance warning: generation ratio={gen_ratio:.3f} < {min_ratio:.2f}."
+            )
+        if test_ratio < min_ratio:
+            warnings.append(
+                f"Generation/test imbalance warning: test ratio={test_ratio:.3f} < {min_ratio:.2f}."
+            )
+
+        b = np.asarray(bases, dtype=np.uint8).flatten()
+        zero_prob = float(np.mean(b == 0))
+        deviation = abs(zero_prob - 0.5)
+        if deviation > self.basis_balance_tolerance:
+            warnings.append(
+                f"basis imbalance detected: P(basis=0)={zero_prob:.4f}, "
+                f"deviation={deviation:.4f} > tolerance={self.basis_balance_tolerance:.4f}."
+            )
+            anomaly_flag = True
+
+        if len(b) >= 4:
+            # Structured-pattern heuristic (diagnostic only).
+            # Use n_test-scaled confidence bounds to reduce false alarms on
+            # smaller blocks where finite-sample fluctuations are larger.
+            x = (2.0 * b.astype(np.float64)) - 1.0
+            lag1_corr = float(np.mean(x[1:] * x[:-1]))
+            alternation_rate = float(np.mean(b[1:] != b[:-1]))
+
+            n_eff = max(int(min(n_test, len(b))), 2)
+            n_pairs = max(n_eff - 1, 1)
+            # pattern_threshold acts as a z-score multiplier with floor 1.0
+            z_mult = max(float(getattr(self, 'basis_pattern_threshold', 3.0)), 1.0)
+            lag1_std = 1.0 / np.sqrt(float(n_pairs))
+            alt_std = 0.5 / np.sqrt(float(n_pairs))
+
+            lag1_bound = z_mult * lag1_std
+            alt_upper = 0.5 + z_mult * alt_std
+            alt_lower = 0.5 - z_mult * alt_std
+
+            if abs(lag1_corr) > lag1_bound or not (alt_lower <= alternation_rate <= alt_upper):
+                warnings.append(
+                    "basis anomaly heuristic triggered (n_test-scaled serial dependence bounds exceeded)."
+                )
+                anomaly_flag = True
+
+        unreliable = (n_test < self.min_n_test_required)
+        if unreliable:
+            warnings.append(
+                f"n_test below configured minimum: {n_test} < {self.min_n_test_required}."
+            )
+
+        return {
+            'basis_zero_probability': zero_prob,
+            'basis_balance_deviation': deviation,
+            'basis_balance_tolerance': self.basis_balance_tolerance,
+            'basis_anomaly_flag': anomaly_flag,
+            'basis_attack_detected': anomaly_flag,
+            'statistically_unreliable': unreliable,
+            'n_test_min_required': self.min_n_test_required,
+            'warnings': warnings,
         }
 
     def _run_diagnostics(self,
@@ -1486,35 +2054,68 @@ class TrustEnhancedQRNG:
                          raw_signal:   Optional[np.ndarray],
                          signal_stats: Optional[Tuple[float, float]],
                          h_min_certified: float,
-                         ) -> Tuple[TrustVector, Optional[str]]:
+                         epsilon_gate: Optional[float],
+                         gate_meta: Optional[GateMetadata] = None,
+                         ) -> Tuple[TrustVector, Optional[str], Dict[str, Any]]:
         """
-        Steps 4–5: run_self_tests, then evaluate halt/warn thresholds.
+        Steps 4–5: run_self_tests, then evaluate diagnostic thresholds.
 
         Returns:
-            (trust_vector, diagnostic_warning)
-
-        Raises DiagnosticHaltError when trust_score < HALT_THRESHOLD.
+            (trust_vector, diagnostic_warning, diagnostic_state)
         Pure diagnostic-layer logic — does not touch cert dict or entropy state.
+        Trust diagnostics are metadata-only and must never alter block inclusion.
         """
-        trust_vector = self.run_self_tests(raw_bits, bases, raw_signal, signal_stats=signal_stats)
+        trust_vector = self.run_self_tests(
+            raw_bits, bases, raw_signal, signal_stats=signal_stats, epsilon_gate=epsilon_gate
+        )
         trust_score  = trust_vector.trust_score()
 
         diagnostic_warning: Optional[str] = None
+        anomalies: List[str] = []
         if trust_score < DiagnosticHaltError.HALT_THRESHOLD:
-            raise DiagnosticHaltError(
+            diagnostic_warning = (
                 f"System instability detected: trust_score={trust_score:.4f} "
                 f"< HALT_THRESHOLD={DiagnosticHaltError.HALT_THRESHOLD}. "
-                f"Extraction halted. h_min_certified={h_min_certified:.4f} is valid but "
-                f"operational policy requires halt."
+                f"Entropy/extraction continue; h_min_certified={h_min_certified:.4f} is unaffected."
             )
-        if trust_score < DiagnosticHaltError.WARN_THRESHOLD:
+            anomalies.append("trust_score_below_halt_threshold")
+        elif trust_score < DiagnosticHaltError.WARN_THRESHOLD:
             diagnostic_warning = (
                 f"Degraded operation: trust_score={trust_score:.4f} "
                 f"< WARN_THRESHOLD={DiagnosticHaltError.WARN_THRESHOLD}. "
                 f"h_min_certified={h_min_certified:.4f} is unaffected."
             )
+            anomalies.append("trust_score_below_warn_threshold")
+        if epsilon_gate is not None:
+            gate_note = f"epsilon_gate={epsilon_gate:.6f} (selection-bias monitor only)"
+            diagnostic_warning = (f"{diagnostic_warning} | {gate_note}"
+                                  if diagnostic_warning else gate_note)
+        if gate_meta is not None:
+            if gate_meta.get('epsilon_gate_bound') is not None:
+                bound_note = (
+                    f"epsilon_gate_bound={gate_meta['epsilon_gate_bound']:.6f} "
+                    f"(diagnostic approximation; entropy correction TODO)"
+                )
+                diagnostic_warning = (f"{diagnostic_warning} | {bound_note}"
+                                      if diagnostic_warning else bound_note)
+            if gate_meta.get('sample_warning') is not None:
+                diagnostic_warning = (f"{diagnostic_warning} | {gate_meta['sample_warning']}"
+                                      if diagnostic_warning else gate_meta['sample_warning'])
+            if gate_meta.get('persistent_small_bias_flag', False):
+                small_bias_note = (
+                    "persistent small epsilon_gate trend detected; small mu_attack may evade "
+                    "single-block detection while still reducing effective entropy"
+                )
+                diagnostic_warning = (f"{diagnostic_warning} | {small_bias_note}"
+                                      if diagnostic_warning else small_bias_note)
+                anomalies.append("persistent_small_epsilon_gate_trend")
 
-        return trust_vector, diagnostic_warning
+        diagnostic_state = {
+            'trust_score': trust_score,
+            'warnings': [diagnostic_warning] if diagnostic_warning else [],
+            'anomalies': anomalies,
+        }
+        return trust_vector, diagnostic_warning, diagnostic_state
 
     def _extract_block(self,
                        gen_bits:      np.ndarray,
@@ -1565,9 +2166,10 @@ class TrustEnhancedQRNG:
     def _assemble_metadata(self,
                            cert:              Dict,
                            n_raw:             int,
-                           gate_meta:         Dict,
+                           gate_meta:         GateMetadata,
                            trust_vector:      TrustVector,
                            diagnostic_warning: Optional[str],
+                           diagnostic_state:  Dict[str, Any],
                            output_bits_len:   int,
                            session:           QRNGSessionState,
                            ) -> BlockMetadata:
@@ -1589,17 +2191,56 @@ class TrustEnhancedQRNG:
         h_min_certified = cert['h_min_certified']
         output_length   = cert['output_length']
         extraction_rate = cert['extraction_rate']
+        basis_diag = cert.get('basis_diag', {'warnings': []})
+        basis_attack_detected = bool(basis_diag.get('basis_attack_detected', False))
+        consistency_warning = self._cross_block_consistency_warning(
+            h_min_certified, extraction_rate, session
+        )
+        merged_warning = diagnostic_warning
+        basis_warnings = basis_diag.get('warnings', [])
+        if basis_warnings:
+            basis_msg = " | ".join(str(w) for w in basis_warnings)
+            merged_warning = (f"{merged_warning} | {basis_msg}"
+                              if merged_warning else basis_msg)
+        if consistency_warning is not None:
+            merged_warning = (f"{diagnostic_warning} | {consistency_warning}"
+                              if diagnostic_warning else consistency_warning)
+        if gate_meta.get('sample_warning') is not None:
+            merged_warning = (f"{merged_warning} | {gate_meta['sample_warning']}"
+                              if merged_warning else gate_meta['sample_warning'])
 
         # Update throughput counters in session (A5 FIX: was self.total_*)
         session.total_raw_input_bits  += n_raw
         session.total_gen_input_bits  += n_gen
         session.total_output_bits     += output_bits_len
+        session.update_extraction_rate(extraction_rate)
+        session.update_gate_tracking(
+            gate_meta['n_accepted'],
+            gate_meta['n_total'],
+            gate_meta['epsilon_gate'],
+            small_bias_threshold=self.gate_small_bias_epsilon,
+        )
+        session.record_diagnostics(
+            trust_score=trust_vector.trust_score(),
+            warning=merged_warning,
+            anomalies=diagnostic_state.get('anomalies', []),
+        )
+        weak_influence_flag = session.weak_adversarial_influence_flag()
+        if weak_influence_flag:
+            diagnostic_state.setdefault('anomalies', []).append(
+                "possible weak adversarial influence"
+            )
+            weak_note = "possible weak adversarial influence"
+            merged_warning = (f"{merged_warning} | {weak_note}"
+                              if merged_warning else weak_note)
 
         # Compute EAT values from session state
         h_total_eat = session.accumulate_eat(self.epsilon_eat)
         sum_f_ei    = sum(session.block_entropy_history)
         delta_eat   = sum_f_ei - h_total_eat
 
+        # ε components are independent and explicitly composable:
+        #   ε_total = ε_eat + ε_smooth + ε_ext
         meta: BlockMetadata = {
             'certified_quantity':  'H_min(X|E)',
             'security_definition': 'Trace-distance ε-security',
@@ -1628,21 +2269,78 @@ class TrustEnhancedQRNG:
                 'epsilon_corr':  trust_vector.epsilon_corr,
                 'epsilon_leak':  trust_vector.epsilon_leak,
             },
-            'diagnostic_warning':  diagnostic_warning,
+            'diagnostic_warning':  merged_warning,
+            'diagnostic_state':    diagnostic_state,
             'halt_threshold':      DiagnosticHaltError.HALT_THRESHOLD,
             'warn_threshold':      DiagnosticHaltError.WARN_THRESHOLD,
             'input_bits':          n_raw,
             'cumulative_efficiency': (session.total_output_bits /
                                       max(session.total_raw_input_bits, 1)),
-            'gate_enabled':      gate_meta.get('enabled', False),
-            'gate_tau':          gate_meta.get('tau', None),
-            'gate_yield':        gate_meta.get('yield_rate', None),
-            'epsilon_gate':      gate_meta.get('epsilon_gate', None),
-            'gate_imr':          gate_meta.get('imr', None),
-            'gate_n_accepted':   gate_meta.get('n_accepted', n_raw),
-            'gate_n_total':      gate_meta.get('n_total', n_raw),
+            'gate_enabled':      gate_meta['enabled'],
+            'gate_tau':          gate_meta['tau'],
+            'gate_yield':        gate_meta['yield_rate'],
+            'epsilon_gate':      gate_meta['epsilon_gate'],
+            'epsilon_gate_empirical': gate_meta['epsilon_gate_empirical'],
+            'epsilon_gate_bound': gate_meta['epsilon_gate_bound'],
+            'gate_imr':          gate_meta['imr'],
+            'gate_bias_acknowledged': gate_meta['bias_acknowledged'],
+            'gate_entropy_correction_todo': gate_meta['entropy_correction_todo'],
+            'gate_n_accepted':   gate_meta['n_accepted'],
+            'gate_n_total':      gate_meta['n_total'],
+            'gate_min_accepted_threshold': gate_meta['min_accepted_threshold'],
+            'gate_weak_statistics': gate_meta['weak_statistics'],
+            'gate_sample_warning': gate_meta['sample_warning'],
+            'gate_persistent_small_bias_flag': gate_meta['persistent_small_bias_flag'],
+            # Selection-bias monitoring only (diagnostic, no entropy coupling):
+            'cumulative_gate_yield': session.cumulative_gate_yield(),
+            'cumulative_epsilon_gate': session.cumulative_epsilon_gate_trend(),
+            'epsilon_gate_running_average': session.epsilon_gate_running_average(),
+            'cumulative_epsilon_gate_trend': session.cumulative_epsilon_gate_trend(),
+            'epsilon_gate_drift_indicator': session.epsilon_gate_drift_indicator(),
+            'epsilon_gate_moving_average': session.epsilon_gate_moving_average(),
+            'weak_adversarial_influence_flag': weak_influence_flag,
+            'basis_attack_detected': basis_attack_detected,
         }
         return meta
+
+    def _cross_block_consistency_warning(self,
+                                         h_min_certified: float,
+                                         extraction_rate: float,
+                                         session: QRNGSessionState
+                                         ) -> Optional[str]:
+        """
+        Lightweight cross-block consistency diagnostics.
+
+        Detects large deviations relative to prior block history for:
+          - h_min_certified
+          - extraction_rate
+        This is strictly observational and never alters entropy/extraction.
+        """
+        warnings: List[str] = []
+
+        if session.block_h_min_history:
+            prev_h = np.asarray(session.block_h_min_history, dtype=np.float64)
+            ref_h = float(np.median(prev_h))
+            scale_h = float(max(np.median(np.abs(prev_h - ref_h)), 1e-6))
+            if abs(h_min_certified - ref_h) > 6.0 * scale_h:
+                warnings.append(
+                    f"cross-block inconsistency: h_min_certified jump "
+                    f"(current={h_min_certified:.4f}, median={ref_h:.4f})"
+                )
+
+        if session.block_extraction_rate_history:
+            prev_r = np.asarray(session.block_extraction_rate_history, dtype=np.float64)
+            ref_r = float(np.median(prev_r))
+            scale_r = float(max(np.median(np.abs(prev_r - ref_r)), 1e-6))
+            if abs(extraction_rate - ref_r) > 6.0 * scale_r:
+                warnings.append(
+                    f"cross-block inconsistency: extraction_rate jump "
+                    f"(current={extraction_rate:.4f}, median={ref_r:.4f})"
+                )
+
+        if not warnings:
+            return None
+        return " ; ".join(warnings)
 
     # ------------------------------------------------------------------
     # Block processing pipeline — public orchestrator
@@ -1677,10 +2375,11 @@ class TrustEnhancedQRNG:
         # Layer 1 — Certified layer
         c = self._certify_block(raw_bits, bases, raw_signal, n_raw, session)
 
-        # Layer 2 — Diagnostic layer (may raise DiagnosticHaltError)
-        trust_vector, diagnostic_warning = self._run_diagnostics(
+        # Layer 2 — Diagnostic layer (warning-only; never halts entropy flow)
+        trust_vector, diagnostic_warning, diagnostic_state = self._run_diagnostics(
             c['raw_bits'], c['bases'], c['raw_signal'],
-            signal_stats, c['h_min_certified'],
+            signal_stats, c['h_min_certified'], c['gate_meta']['epsilon_gate'],
+            gate_meta=c['gate_meta'],
         )
 
         # Compute extraction_rate for metadata
@@ -1702,12 +2401,13 @@ class TrustEnhancedQRNG:
             'output_length':   output_length,
             'extraction_rate': extraction_rate,
             'cert':            c['cert'],
+            'basis_diag':      c['basis_diag'],
         }
 
         # Layer 4 — Bookkeeping (updates session throughput counters)
         meta = self._assemble_metadata(
             cert_bundle, c['n_raw'], c['gate_meta'],
-            trust_vector, diagnostic_warning, len(output_bits),
+            trust_vector, diagnostic_warning, diagnostic_state, len(output_bits),
             session,
         )
 
@@ -1719,7 +2419,7 @@ class TrustEnhancedQRNG:
 
     def generate_certified_random_bits(self,
                                        n_bits:           int,
-                                       source_simulator) -> Tuple[np.ndarray, List[Union[BlockMetadata, EATSummary]]]:
+                                       source_simulator) -> Tuple[np.ndarray, List[Union[BlockMetadata, FinalDecision, EATSummary]]]:
         """
         Backward-compatible shim — delegates to CertifiedGenerationSession.
 

@@ -194,8 +194,6 @@ def _run_exp2_scenario(args) -> Tuple[str, Dict]:
         empirical_h = 0.0
 
     final_summary = metadata_list[-1]
-    if not isinstance(final_summary, dict):
-        raise RuntimeError("Invalid metadata summary type.")
     summary_typed: EATSummary = final_summary
     h_total_eat           = summary_typed['h_total_eat']
     certified_output_bits = summary_typed['certified_output_bits']
@@ -206,8 +204,6 @@ def _run_exp2_scenario(args) -> Tuple[str, Dict]:
     h_total_progression = []
     delta_progression   = []
     for meta in metadata_list[:-1]:
-        if not isinstance(meta, dict):
-            raise RuntimeError("Invalid block metadata type.")
         meta_typed: BlockMetadata = meta
         h_total_progression.append(meta_typed['h_total_eat'])
         delta_progression.append(meta_typed['delta_eat'])

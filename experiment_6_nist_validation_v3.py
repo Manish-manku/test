@@ -55,7 +55,7 @@ import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 import numpy as np
 
-from D_v16 import TrustEnhancedQRNG
+from D_v16 import TrustEnhancedQRNG, EATSummary
 from New_simulator_v9 import (
     QuantumSourceSimulator,
     create_test_scenarios,
@@ -102,14 +102,17 @@ def _worker_post_extraction(args) -> Tuple[str, Dict]:
             n_bits=len(output_bits),
         )
 
-    final_meta = metadata_list[-1] if metadata_list else {}
+    h_total_eat = 0.0
+    if metadata_list:
+        final_meta: EATSummary = metadata_list[-1]
+        h_total_eat = final_meta['h_total_eat']
 
     return scenario_name, {
         "p_values":    nist_result.p_values,
         "passed":      nist_result.passed,
         "pass_rate":   nist_result.pass_rate(),
         "n_bits":      len(output_bits),
-        "h_total_eat": final_meta.get("h_total_eat", 0.0),
+        "h_total_eat": h_total_eat,
         "backend":     nist_result.backend,
     }
 

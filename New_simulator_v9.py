@@ -7,7 +7,7 @@ realistic imperfections, drift, and attack scenarios.
 """
 
 import numpy as np
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -179,15 +179,28 @@ class QuantumSourceSimulator:
     PHASE_NOISE     — Vacuum quadrature measurement (Gaussian source).
     """
 
-    def __init__(self, params: SourceParameters, seed: Optional[int] = None):
+    def __init__(self,
+                 params: SourceParameters,
+                 seed: Optional[int] = None,
+                 basis_bias_probability: Optional[float] = None,
+                 basis_hook: Optional[Callable[[np.random.RandomState, int], np.ndarray]] = None):
         """
         Args:
             params: Source-specific parameter object (e.g. BiasedParams).
             seed:   Optional RNG seed for reproducibility.
+            basis_bias_probability:
+                Optional simulator hook for adversarial basis bias testing.
+                If set, bases are drawn with P(basis=0)=basis_bias_probability
+                instead of 0.5. Purely for stress-testing basis diagnostics.
+            basis_hook:
+                Optional custom hook(rng, n_bits) -> np.ndarray for basis
+                generation. If provided, overrides basis_bias_probability.
         """
         self.params    = params
         self.rng       = np.random.RandomState(seed)
         self.time_step = 0
+        self.basis_bias_probability = basis_bias_probability
+        self.basis_hook = basis_hook
 
         # State used only by specific source types
         self._memory_buffer: list[int] = []  # Used by CORRELATED
@@ -203,6 +216,31 @@ class QuantumSourceSimulator:
             SourceType.PHOTON_COUNTING:          self._generate_photon_counting,
             SourceType.PHASE_NOISE:              self._generate_phase_noise,
         }
+    
+    def _generate_bases(self, n_bits: int) -> np.ndarray:
+        """
+        Generate basis choices.
+
+        Default behavior is unbiased Bernoulli(0.5). Optional hooks allow
+        adversarial basis-bias simulation without changing QRNG pipeline logic.
+        """
+        if self.basis_hook is not None:
+            bases = np.asarray(self.basis_hook(self.rng, n_bits), dtype=np.uint8)
+            if bases.shape != (n_bits,):
+                raise ValueError(
+                    f"basis_hook returned shape {bases.shape}, expected ({n_bits},)."
+                )
+            return np.bitwise_and(bases, 1).astype(np.uint8)
+
+        if self.basis_bias_probability is None:
+            return self.rng.randint(0, 2, size=n_bits, dtype=np.uint8)
+
+        p0 = float(self.basis_bias_probability)
+        if not (0.0 <= p0 <= 1.0):
+            raise ValueError(
+                f"basis_bias_probability must be in [0, 1], got {p0}."
+            )
+        return (self.rng.rand(n_bits) >= p0).astype(np.uint8)
 
     # ------------------------------------------------------------------
     # Public API
@@ -321,7 +359,7 @@ class QuantumSourceSimulator:
     def _generate_ideal(self, n_bits: int) -> GeneratedBlock:
         """Perfect quantum randomness — 50/50, no correlations."""
         bits       = self.rng.randint(0, 2, size=n_bits, dtype=np.uint8)
-        bases      = self.rng.randint(0, 2, size=n_bits, dtype=np.uint8)
+        bases      = self._generate_bases(n_bits)
         raw_signal = self.rng.randn(n_bits)
 
         self.time_step += n_bits
@@ -333,7 +371,7 @@ class QuantumSourceSimulator:
         prob_one   = 0.5 + p.bias
 
         bits       = (self.rng.rand(n_bits) < prob_one).astype(np.uint8)
-        bases      = self.rng.randint(0, 2, size=n_bits, dtype=np.uint8)
+        bases      = self._generate_bases(n_bits)
         raw_signal = self.rng.randn(n_bits) + p.bias * 2
 
         self.time_step += n_bits
@@ -352,7 +390,7 @@ class QuantumSourceSimulator:
         probs  = np.clip(0.5 + drift, 0.01, 0.99)
 
         bits       = (self.rng.rand(n_bits) < probs).astype(np.uint8)
-        bases      = self.rng.randint(0, 2, size=n_bits, dtype=np.uint8)
+        bases      = self._generate_bases(n_bits)
         raw_signal = self.rng.randn(n_bits) + drift * 2
 
         self.time_step += n_bits
@@ -373,7 +411,7 @@ class QuantumSourceSimulator:
         use_memory   = self.rng.rand(n_bits) < correlation_strength
         fresh_bits   = self.rng.randint(0, 2, size=n_bits, dtype=np.uint8)
         raw_signal   = self.rng.randn(n_bits)
-        bases        = self.rng.randint(0, 2, size=n_bits, dtype=np.uint8)
+        bases        = self._generate_bases(n_bits)
 
         bits = np.empty(n_bits, dtype=np.uint8)
         last = self._memory_buffer[-1] if self._memory_buffer else fresh_bits[0]
@@ -422,7 +460,7 @@ class QuantumSourceSimulator:
             bits[s:e]    = 1
             forcing[s:e] = 1.0   # mark forced positions in signal
 
-        bases = self.rng.randint(0, 2, size=n_bits, dtype=np.uint8)
+        bases = self._generate_bases(n_bits)
 
         # raw_signal: base noise + constant attack offset + periodic forcing spike.
         # The forcing spike raises local signal values and inflates std beyond the
@@ -468,7 +506,7 @@ class QuantumSourceSimulator:
         bits = (measured > 0).astype(np.uint8)
 
         # Step 3: Bases chosen independently of signal
-        bases = self.rng.randint(0, 2, size=n_bits, dtype=np.uint8)
+        bases = self._generate_bases(n_bits)
 
         # Step 4: raw_signal IS the pre-threshold measurement
         # No post-hoc construction — this is genuinely pre-value
@@ -501,7 +539,7 @@ class QuantumSourceSimulator:
         bits[dark_count] = self.rng.randint(0, 2, size=dark_count.sum()); raw_signal[dark_count] = 0.5
         bits[missed]     = self.rng.randint(0, 2, size=missed.sum());     raw_signal[missed]     = 0.0
 
-        bases = self.rng.randint(0, 2, size=n_bits, dtype=np.uint8)
+        bases = self._generate_bases(n_bits)
 
         self.time_step += n_bits
         return GeneratedBlock(bits, bases, raw_signal)
@@ -517,7 +555,7 @@ class QuantumSourceSimulator:
         x = self.rng.randn(n_bits) + self.rng.randn(n_bits) * p.noise_level
         q = self.rng.randn(n_bits) + self.rng.randn(n_bits) * p.noise_level
 
-        bases        = self.rng.randint(0, 2, size=n_bits, dtype=np.uint8)
+        bases        = self._generate_bases(n_bits)
         measured     = np.where(bases == 0, x, q)          # Choose quadrature
         bits         = (measured > 0).astype(np.uint8)     # Sign → bit
 

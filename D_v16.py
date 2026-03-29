@@ -161,6 +161,12 @@ class BlockMetadata(TypedDict):
     trust_score:           float
     trust_vector:          dict   # {epsilon_bias, epsilon_drift, epsilon_corr, epsilon_leak}
     diagnostic_warning:    Optional[str]
+    basis_zero_probability: Optional[float]
+    basis_balance_deviation: Optional[float]
+    basis_balance_tolerance: Optional[float]
+    statistically_unreliable: bool
+    n_test_min_required:   int
+    basis_anomaly_flag:    bool
     halt_threshold:        float
     warn_threshold:        float
     # ---- Throughput -------------------------------------------------------
@@ -1242,7 +1248,6 @@ class CertifiedGenerationSession:
 
         Raises:
             ValueError:              n_bits <= 0
-            DiagnosticHaltError:     trust_score falls below HALT_THRESHOLD
             EATConvergenceWarning:   EAT bound not reached within 50×n_bits raw bits
             InsufficientEntropyError: certified output length < 1 after EAT
         """
@@ -1266,22 +1271,10 @@ class CertifiedGenerationSession:
             signal_stats = (source_simulator.get_signal_stats()
                             if hasattr(source_simulator, 'get_signal_stats') else None)
 
-            try:
-                _, block_meta = self.te_qrng.process_block(
-                    raw_bits, bases, raw_signal, session=session,
-                    signal_stats=signal_stats
-                )
-            except DiagnosticHaltError as exc:
-                halt_meta = {
-                    'certified_quantity':  'H_min(X|E)',
-                    'security_definition': 'Trace-distance ε-security',
-                    'halt': True,
-                    'halt_reason': str(exc),
-                    'blocks_used': len(session.block_entropy_history),
-                    'h_total_eat': session.accumulate_eat(self.epsilon_eat),
-                }
-                metadata_list.append(halt_meta)
-                raise
+            _, block_meta = self.te_qrng.process_block(
+                raw_bits, bases, raw_signal, session=session,
+                signal_stats=signal_stats
+            )
 
             metadata_list.append(block_meta)
 
@@ -1442,11 +1435,17 @@ class TrustEnhancedQRNG:
                  extractor_efficiency: float = 0.9,
                  enable_gating:        bool  = True,
                  sigma_signal:         float = 1.0,
-                 yield_min:            float = 0.30):
+                 yield_min:            float = 0.30,
+                 min_n_test_required:  int   = 100,
+                 basis_balance_tolerance: float = 0.10,
+                 basis_pattern_threshold: float = 0.15):
         self.block_size           = block_size
         self.security_parameter   = security_parameter
         self.extractor_efficiency = extractor_efficiency
         self.enable_gating        = enable_gating
+        self.min_n_test_required  = int(min_n_test_required)
+        self.basis_balance_tolerance = float(basis_balance_tolerance)
+        self.basis_pattern_threshold = float(basis_pattern_threshold)
 
         # Components
         self.stat_tester       = StatisticalSelfTester(window_size=block_size)
@@ -1608,6 +1607,7 @@ class TrustEnhancedQRNG:
         )
         h_min_certified = cert['h_min_certified']
         # INVARIANT: h_min_certified is derived solely from p_max_upper.
+        basis_diag = self._basis_diagnostics(bases, n_test)
 
         # Step 3: Store f(eᵢ)·n_gen_i for EAT accumulation — via session
         # A5 FIX: was self.block_entropy_history.append(...), now session.append_block()
@@ -1624,6 +1624,76 @@ class TrustEnhancedQRNG:
             'n_test':          n_test,
             'cert':            cert,
             'h_min_certified': h_min_certified,
+            'basis_diag':      basis_diag,
+        }
+
+    def _basis_diagnostics(self,
+                           bases: Optional[np.ndarray],
+                           n_test: int) -> Dict[str, Union[bool, int, Optional[float], List[str]]]:
+        """
+        Basis diagnostics (metadata-only; never coupled to entropy/extraction).
+
+        Assumption note:
+        Current system assumes honest basis generation. Adversarial
+        basis-manipulation attacks are not fully mitigated in this release.
+        """
+        warnings: List[str] = []
+        zero_prob: Optional[float] = None
+        deviation: Optional[float] = None
+        anomaly_flag = False
+
+        if bases is None or len(bases) == 0:
+            unreliable = (n_test < self.min_n_test_required)
+            if unreliable:
+                warnings.append(
+                    f"n_test below configured minimum: {n_test} < {self.min_n_test_required}."
+                )
+            return {
+                'basis_zero_probability': zero_prob,
+                'basis_balance_deviation': deviation,
+                'basis_balance_tolerance': self.basis_balance_tolerance,
+                'basis_anomaly_flag': anomaly_flag,
+                'statistically_unreliable': unreliable,
+                'n_test_min_required': self.min_n_test_required,
+                'warnings': warnings,
+            }
+
+        b = np.asarray(bases, dtype=np.uint8).flatten()
+        zero_prob = float(np.mean(b == 0))
+        deviation = abs(zero_prob - 0.5)
+        if deviation > self.basis_balance_tolerance:
+            warnings.append(
+                f"basis imbalance detected: P(basis=0)={zero_prob:.4f}, "
+                f"deviation={deviation:.4f} > tolerance={self.basis_balance_tolerance:.4f}."
+            )
+            anomaly_flag = True
+
+        if len(b) >= 4:
+            # Structured-pattern heuristic (diagnostic only).
+            x = (2.0 * b.astype(np.float64)) - 1.0
+            lag1_corr = float(np.mean(x[1:] * x[:-1]))
+            alternation_rate = float(np.mean(b[1:] != b[:-1]))
+            if (abs(lag1_corr) > (1.0 - self.basis_pattern_threshold) or
+                    alternation_rate > (1.0 - 0.5 * self.basis_pattern_threshold)):
+                warnings.append(
+                    "basis anomaly heuristic triggered (structured pattern / high serial dependence)."
+                )
+                anomaly_flag = True
+
+        unreliable = (n_test < self.min_n_test_required)
+        if unreliable:
+            warnings.append(
+                f"n_test below configured minimum: {n_test} < {self.min_n_test_required}."
+            )
+
+        return {
+            'basis_zero_probability': zero_prob,
+            'basis_balance_deviation': deviation,
+            'basis_balance_tolerance': self.basis_balance_tolerance,
+            'basis_anomaly_flag': anomaly_flag,
+            'statistically_unreliable': unreliable,
+            'n_test_min_required': self.min_n_test_required,
+            'warnings': warnings,
         }
 
     def _run_diagnostics(self,
@@ -1640,8 +1710,8 @@ class TrustEnhancedQRNG:
         Returns:
             (trust_vector, diagnostic_warning)
 
-        Raises DiagnosticHaltError when trust_score < HALT_THRESHOLD.
         Pure diagnostic-layer logic — does not touch cert dict or entropy state.
+        Trust diagnostics are metadata-only and must never alter block inclusion.
         """
         trust_vector = self.run_self_tests(
             raw_bits, bases, raw_signal, signal_stats=signal_stats, epsilon_gate=epsilon_gate
@@ -1650,18 +1720,19 @@ class TrustEnhancedQRNG:
 
         diagnostic_warning: Optional[str] = None
         if trust_score < DiagnosticHaltError.HALT_THRESHOLD:
-            raise DiagnosticHaltError(
+            diagnostic_warning = (
                 f"System instability detected: trust_score={trust_score:.4f} "
                 f"< HALT_THRESHOLD={DiagnosticHaltError.HALT_THRESHOLD}. "
-                f"Extraction halted. h_min_certified={h_min_certified:.4f} is valid but "
-                f"operational policy requires halt."
+                f"h_min_certified={h_min_certified:.4f} is unaffected."
             )
         if trust_score < DiagnosticHaltError.WARN_THRESHOLD:
-            diagnostic_warning = (
+            warn_msg = (
                 f"Degraded operation: trust_score={trust_score:.4f} "
                 f"< WARN_THRESHOLD={DiagnosticHaltError.WARN_THRESHOLD}. "
                 f"h_min_certified={h_min_certified:.4f} is unaffected."
             )
+            diagnostic_warning = (f"{diagnostic_warning} | {warn_msg}"
+                                  if diagnostic_warning else warn_msg)
         if epsilon_gate is not None:
             gate_note = f"epsilon_gate={epsilon_gate:.6f} (selection-bias monitor only)"
             diagnostic_warning = (f"{diagnostic_warning} | {gate_note}"
@@ -1721,6 +1792,7 @@ class TrustEnhancedQRNG:
                            gate_meta:         GateMetadata,
                            trust_vector:      TrustVector,
                            diagnostic_warning: Optional[str],
+                           basis_diag:        Dict[str, Union[bool, int, Optional[float], List[str]]],
                            output_bits_len:   int,
                            session:           QRNGSessionState,
                            ) -> BlockMetadata:
@@ -1746,9 +1818,14 @@ class TrustEnhancedQRNG:
             h_min_certified, extraction_rate, session
         )
         merged_warning = diagnostic_warning
+        basis_warnings = basis_diag.get('warnings', [])
+        if basis_warnings:
+            basis_msg = " | ".join(str(w) for w in basis_warnings)
+            merged_warning = (f"{merged_warning} | {basis_msg}"
+                              if merged_warning else basis_msg)
         if consistency_warning is not None:
-            merged_warning = (f"{diagnostic_warning} | {consistency_warning}"
-                              if diagnostic_warning else consistency_warning)
+            merged_warning = (f"{merged_warning} | {consistency_warning}"
+                              if merged_warning else consistency_warning)
 
         # Update throughput counters in session (A5 FIX: was self.total_*)
         session.total_raw_input_bits  += n_raw
@@ -1797,6 +1874,12 @@ class TrustEnhancedQRNG:
                 'epsilon_leak':  trust_vector.epsilon_leak,
             },
             'diagnostic_warning':  merged_warning,
+            'basis_zero_probability': basis_diag['basis_zero_probability'],
+            'basis_balance_deviation': basis_diag['basis_balance_deviation'],
+            'basis_balance_tolerance': basis_diag['basis_balance_tolerance'],
+            'statistically_unreliable': bool(basis_diag['statistically_unreliable']),
+            'n_test_min_required': int(basis_diag['n_test_min_required']),
+            'basis_anomaly_flag': bool(basis_diag['basis_anomaly_flag']),
             'halt_threshold':      DiagnosticHaltError.HALT_THRESHOLD,
             'warn_threshold':      DiagnosticHaltError.WARN_THRESHOLD,
             'input_bits':          n_raw,
@@ -1887,7 +1970,7 @@ class TrustEnhancedQRNG:
         # Layer 1 — Certified layer
         c = self._certify_block(raw_bits, bases, raw_signal, n_raw, session)
 
-        # Layer 2 — Diagnostic layer (may raise DiagnosticHaltError)
+        # Layer 2 — Diagnostic layer (warning-only; no entropy coupling)
         trust_vector, diagnostic_warning = self._run_diagnostics(
             c['raw_bits'], c['bases'], c['raw_signal'],
             signal_stats, c['h_min_certified'], c['gate_meta']['epsilon_gate'],
@@ -1917,7 +2000,7 @@ class TrustEnhancedQRNG:
         # Layer 4 — Bookkeeping (updates session throughput counters)
         meta = self._assemble_metadata(
             cert_bundle, c['n_raw'], c['gate_meta'],
-            trust_vector, diagnostic_warning, len(output_bits),
+            trust_vector, diagnostic_warning, c['basis_diag'], len(output_bits),
             session,
         )
 

@@ -1103,12 +1103,10 @@ class CertifiedGenerationSession:
         # Create a fresh session state for this run
         session = QRNGSessionState()
 
-        all_gen_bits:  List[np.ndarray] = []
-        metadata_list: List[Dict]       = []
+        all_gen_bits:  List[np.ndarray]                         = []
+        metadata_list: List[Union[BlockMetadata, EATSummary]]  = []
 
         block_size = self.te_qrng.block_size
-        convergence_warning: Optional[str] = None
-
         while True:
             raw_bits, bases, raw_signal = source_simulator.generate_block(block_size)
 
@@ -1149,12 +1147,12 @@ class CertifiedGenerationSession:
 
             total_gen = sum(len(g) for g in all_gen_bits)
             if total_gen > 50 * n_bits:
-                convergence_warning = (
-                    "CertifiedGenerationSession.run: EAT bound not reached after "
-                    f"total_gen={total_gen} bits ({50 * n_bits} limit). "
-                    f"Proceeding with partial certified output for requested n_bits={n_bits}."
+                raise EATConvergenceWarning(
+                    "CertifiedGenerationSession.run: EAT convergence not reached; "
+                    f"requested_bits={n_bits}, total_gen={total_gen}, "
+                    f"max_total_gen={50 * n_bits}, blocks_used={len(session.block_entropy_history)}, "
+                    f"h_total_eat={h_total:.6f}, max_output_bits={max_output_bits}."
                 )
-                break
 
         # Global final Toeplitz extraction
         all_gen_concat = (np.concatenate(all_gen_bits)
@@ -1166,26 +1164,6 @@ class CertifiedGenerationSession:
         output_length    = min(n_bits, certified_output)
 
         if output_length < 1 or len(all_gen_concat) < 2:
-            if convergence_warning is not None:
-                n_total_convergence = sum(session.block_n_gen_history)
-                eat_summary: EATSummary = {
-                    'certified_quantity':    'H_min(X|E)',
-                    'security_definition':   'Trace-distance ε-security',
-                    'epsilon_total':         self.te_qrng.epsilon_total,
-                    'epsilon_eat':           self.epsilon_eat,
-                    'epsilon_smooth':        self.te_qrng.epsilon_smooth,
-                    'epsilon_ext':           self.epsilon_ext,
-                    'blocks_used':           len(session.block_entropy_history),
-                    'h_total_eat':           h_total,
-                    'certified_output_bits': certified_output,
-                    'actual_output_bits':    0,
-                    'delta_eat':             (2.0 * np.sqrt(n_total_convergence) *
-                                              np.sqrt(np.log(1.0 / self.epsilon_eat))
-                                              if len(session.block_entropy_history) > 0 else 0.0),
-                    'sum_f_ei':              sum(session.block_entropy_history),
-                }
-                metadata_list.append(eat_summary)
-                return np.array([], dtype=np.uint8), metadata_list
             raise InsufficientEntropyError(
                 f"CertifiedGenerationSession.run: certified output length is "
                 f"{output_length} bits after EAT accumulation. "

@@ -716,10 +716,14 @@ class PreValueGate:
               bases:      np.ndarray,
               min_accepted_threshold: int = 100,
               mu_attack: Optional[float] = None,
+              pre_truncation_mean: Optional[float] = None,
               persistent_small_bias_flag: bool = False,
               ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, GateMetadata]:
         n_total     = len(raw_signal)
-        pre_gate_mean = float(np.mean(raw_signal)) if n_total > 0 else 0.0
+        pre_gate_mean = (
+            float(pre_truncation_mean) if pre_truncation_mean is not None
+            else (float(np.mean(raw_signal)) if n_total > 0 else 0.0)
+        )
         gate_mask   = np.abs(raw_signal) > self.tau
 
         accepted_signal = raw_signal[gate_mask]
@@ -878,7 +882,8 @@ class EntropyEstimator:
     def certify_min_entropy(self,
                             bits:  np.ndarray,
                             bases: np.ndarray,
-                            epsilon_gate_empirical: Optional[float] = None) -> Dict:
+                            epsilon_gate_empirical: Optional[float] = None,
+                            gate_yield_rate: Optional[float] = None) -> Dict:
         # F10 FIX: validate inputs before use.
         bits  = np.asarray(bits,  dtype=np.uint8).flatten()
         bases = np.asarray(bases, dtype=np.uint8).flatten()
@@ -907,9 +912,15 @@ class EntropyEstimator:
 
         delta            = np.sqrt(np.log(1.0 / self.epsilon_smooth) / (2.0 * n_test))
         p_max_upper      = min(p_max_hat + delta, 1.0)
-        eps_gate = float(np.clip(epsilon_gate_empirical, 0.0, 0.5)) \
+        eps_gate_emp = float(np.clip(epsilon_gate_empirical, 0.0, 0.5)) \
             if epsilon_gate_empirical is not None else 0.0
-        p_max_upper_postselect = min(p_max_upper + eps_gate, 1.0)
+        gate_yield = float(np.clip(gate_yield_rate, 1e-12, 1.0)) \
+            if gate_yield_rate is not None else 1.0
+        postselect_correction_factor = 1.0 / gate_yield
+        eps_gate_corrected = float(np.clip(
+            eps_gate_emp * postselect_correction_factor, 0.0, 0.5
+        ))
+        p_max_upper_postselect = min(p_max_upper + eps_gate_corrected, 1.0)
 
         h_min_certified  = max(-np.log2(p_max_upper_postselect), 0.0)
 
@@ -920,7 +931,10 @@ class EntropyEstimator:
             'p_max_hat':       p_max_hat,
             'delta':           delta,
             'p_max_upper':     p_max_upper,
-            'epsilon_gate_empirical': eps_gate,
+            'epsilon_gate_empirical': eps_gate_emp,
+            'gate_yield_rate': gate_yield,
+            'postselect_correction_factor': postselect_correction_factor,
+            'epsilon_gate_corrected': eps_gate_corrected,
             'p_max_upper_postselect': p_max_upper_postselect,
             'h_min_certified': h_min_certified,
         }
@@ -941,6 +955,9 @@ class EntropyEstimator:
                 'p_hat': 1.0, 'p_max_hat': 1.0,
                 'delta': 0.0, 'p_max_upper': 1.0,
                 'epsilon_gate_empirical': 0.0,
+                'gate_yield_rate': 1.0,
+                'postselect_correction_factor': 1.0,
+                'epsilon_gate_corrected': 0.0,
                 'p_max_upper_postselect': 1.0,
                 'h_min_certified': 0.0}
 
@@ -966,6 +983,8 @@ class RandomnessExtractor:
                              weak_random: np.ndarray,
                              seed:        np.ndarray,
                              out_len:     int) -> np.ndarray:
+        weak_random = np.asarray(weak_random, dtype=np.float64).flatten()
+        seed = np.asarray(seed, dtype=np.float64).flatten()
         n = len(weak_random)
         m = out_len
 
@@ -973,8 +992,8 @@ class RandomnessExtractor:
         if len(seed) < required:
             seed = self._extend_seed(seed, required)
 
-        col      = seed[:m].astype(np.float64)
-        row_tail = seed[1:n].astype(np.float64)
+        col      = seed[:m]
+        row_tail = seed[1:n]
 
         raw_size  = m + n
         circ_size = 1 << int(np.ceil(np.log2(max(raw_size, 2))))
@@ -991,13 +1010,17 @@ class RandomnessExtractor:
             circ_col[circ_size - len(row_tail):] = row_tail[::-1]
 
         x_pad = np.zeros(circ_size, dtype=np.float64)
-        x_pad[:n] = weak_random.astype(np.float64)
+        x_pad[:n] = weak_random
 
         try:
+            # Keep the whole FFT pipeline in float64/complex128 to avoid
+            # reconstruction errors that can flip parity bits after rounding.
+            fft_col = np.fft.rfft(circ_col).astype(np.complex128, copy=False)
+            fft_x = np.fft.rfft(x_pad).astype(np.complex128, copy=False)
             y_full = np.fft.irfft(
-                np.fft.rfft(circ_col) * np.fft.rfft(x_pad),
+                fft_col * fft_x,
                 n=circ_size
-            )
+            ).astype(np.float64, copy=False)
         except MemoryError:
             raise MemoryError(
                 f"_toeplitz_fft_chunk: n={n}, m={m}, circ_size={circ_size}. "
@@ -1879,11 +1902,13 @@ class TrustEnhancedQRNG:
             persistent_small_bias_flag = session.persistent_small_gate_bias_flag(
                 min_blocks=self.gate_small_bias_window
             )
+            pre_truncation_mean = float(np.mean(raw_signal)) if len(raw_signal) > 0 else 0.0
             _, raw_bits, bases_gated, gate_meta = self.pre_value_gate.apply(
                 raw_signal, raw_bits,
                 bases if bases is not None else np.zeros(n_raw, dtype=np.uint8),
                 min_accepted_threshold=self.gate_min_accepted_threshold,
                 mu_attack=None,
+                pre_truncation_mean=pre_truncation_mean,
                 persistent_small_bias_flag=persistent_small_bias_flag,
             )
             if bases is not None:
@@ -1906,7 +1931,8 @@ class TrustEnhancedQRNG:
         cert = self.entropy_estimator.certify_min_entropy(
             raw_bits,
             bases if bases is not None else np.zeros(n_raw, dtype=np.uint8),
-            epsilon_gate_empirical=gate_meta.get('epsilon_gate_empirical')
+            epsilon_gate_empirical=gate_meta.get('epsilon_gate_empirical'),
+            gate_yield_rate=gate_meta.get('yield_rate')
         )
         h_min_certified = cert['h_min_certified']
         # INVARIANT: h_min_certified is derived solely from p_max_upper.

@@ -852,8 +852,7 @@ class RandomnessExtractor:
 
         seed_bytes = np.packbits(seed[:min(len(seed), 2048)]).tobytes()
 
-        output_chunks: List[np.ndarray] = []
-        bits_produced = 0
+        output_accum = np.zeros(m, dtype=np.uint8)
         chunk_nonce   = 0
 
         for i in range(n_chunks):
@@ -865,13 +864,16 @@ class RandomnessExtractor:
                 continue
 
             max_mc_i = max(max_raw_size - nc_i, 1)
-            remaining = m - bits_produced
-            while remaining > 0:
-                mc_i = min(remaining, max_mc_i)
+            per_chunk_segments: List[np.ndarray] = []
+            chunk_bits_produced = 0
+            while chunk_bits_produced < m:
+                remaining_for_chunk = m - chunk_bits_produced
+                mc_i = min(remaining_for_chunk, max_mc_i)
                 if mc_i <= 0:
                     raise ExtractionFailureError(
                         f"toeplitz_extract: unable to size chunk safely (nc_i={nc_i}, "
-                        f"max_raw_size={max_raw_size}, remaining={remaining})."
+                        f"max_raw_size={max_raw_size}, "
+                        f"remaining_for_chunk={remaining_for_chunk})."
                     )
 
                 chunk_seed = self._derive_chunk_seed(
@@ -885,33 +887,27 @@ class RandomnessExtractor:
                         f"chunk_nonce={chunk_nonce}."
                     ) from exc
 
-                output_chunks.append(out_chunk)
-                bits_produced += len(out_chunk)
+                per_chunk_segments.append(out_chunk)
+                chunk_bits_produced += len(out_chunk)
                 chunk_nonce += 1
-                remaining = m - bits_produced
 
-                if bits_produced >= m:
-                    break
-            if bits_produced >= m:
-                break
+            if not per_chunk_segments:
+                raise ExtractionFailureError(
+                    f"toeplitz_extract: chunk {i} produced no output. "
+                    f"n={n}, m={m}, n_chunks={n_chunks}, nc_i={nc_i}."
+                )
 
-        if not output_chunks:
-            raise ExtractionFailureError(
-                f"toeplitz_extract: chunked path produced no output. "
-                f"n={n}, m={m}, n_chunks={n_chunks}. "
-                "This would previously have returned all-zero bits silently."
-            )
+            chunk_result = np.concatenate(per_chunk_segments)
+            if len(chunk_result) < m:
+                raise ExtractionFailureError(
+                    f"toeplitz_extract: chunk {i} produced {len(chunk_result)} bits "
+                    f"but {m} were required for accumulation. "
+                    f"n={n}, m={m}, n_chunks={n_chunks}, nc_i={nc_i}."
+                )
 
-        result = np.concatenate(output_chunks)
+            output_accum ^= chunk_result[:m].astype(np.uint8, copy=False)
 
-        if len(result) < m:
-            raise ExtractionFailureError(
-                f"toeplitz_extract: chunked path produced {len(result)} bits "
-                f"but {m} were requested. "
-                f"n={n}, m={m}, n_chunks={n_chunks}, bits_produced={len(result)}."
-            )
-
-        return result[:m]
+        return output_accum[:m]
 
     def _derive_chunk_seed(self, master_seed_bytes: bytes,
                             chunk_idx: int, length: int) -> np.ndarray:

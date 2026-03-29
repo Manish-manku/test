@@ -5,6 +5,12 @@ Trust-Enhanced Source-Independent Quantum Random Number Generator (TE-SI-QRNG)
 A self-testing approach to quantum random number generation that provides
 measurable trust guarantees without requiring full device-independence.
 
+SECURITY SCOPE (explicit)
+-------------------------
+This implementation certifies entropy under a classical source model
+(classical side information / trusted measurement assumptions). It does NOT
+claim full composable security against a general quantum adversary.
+
 Authors: Research Team
 Date: January 2025
 
@@ -190,6 +196,7 @@ class BlockMetadata(TypedDict):
     epsilon_gate_drift_indicator: Optional[float]
     epsilon_gate_moving_average: Optional[float]
     weak_adversarial_influence_flag: bool
+    basis_attack_detected:  bool
 
 
 class EATSummary(TypedDict):
@@ -379,6 +386,8 @@ def _sigmoid(x: float, k: float, x0: float) -> float:
     ------------------
     k  controls steepness: higher k = sharper transition.
     x0 is the inflection point (maps to ε = 0.5).
+    Both parameters are calibration heuristics used for diagnostics only
+    (not entropy certification inputs).
 
     Choosing x0 at roughly the "clearly problematic but not worst-case"
     value ensures:
@@ -1714,6 +1723,8 @@ class TrustEnhancedQRNG:
         calibrated heuristics, not formally derived security bounds. The halt
         threshold (0.2) and warn threshold (0.5) are operational policy choices.
         None of these values appear in the certified entropy bound.
+        Consequently, trust_score is a diagnostic heuristic only and must never
+        be interpreted as a security parameter.
         """
        
         autocorr_pass, max_autocorr = self.stat_tester.autocorrelation_test(raw_bits)
@@ -1882,6 +1893,8 @@ class TrustEnhancedQRNG:
         Assumption note:
         Current system assumes honest basis generation. Adversarial
         basis-manipulation attacks are not fully mitigated in this release.
+        Returned flag `basis_attack_detected` is heuristic-only metadata
+        (imbalance/pattern indicators), not a proven detector.
         """
         warnings: List[str] = []
         zero_prob: Optional[float] = None
@@ -1899,6 +1912,7 @@ class TrustEnhancedQRNG:
                 'basis_balance_deviation': deviation,
                 'basis_balance_tolerance': self.basis_balance_tolerance,
                 'basis_anomaly_flag': anomaly_flag,
+                'basis_attack_detected': anomaly_flag,
                 'statistically_unreliable': unreliable,
                 'n_test_min_required': self.min_n_test_required,
                 'warnings': warnings,
@@ -1950,6 +1964,7 @@ class TrustEnhancedQRNG:
             'basis_balance_deviation': deviation,
             'basis_balance_tolerance': self.basis_balance_tolerance,
             'basis_anomaly_flag': anomaly_flag,
+            'basis_attack_detected': anomaly_flag,
             'statistically_unreliable': unreliable,
             'n_test_min_required': self.min_n_test_required,
             'warnings': warnings,
@@ -2099,6 +2114,7 @@ class TrustEnhancedQRNG:
         output_length   = cert['output_length']
         extraction_rate = cert['extraction_rate']
         basis_diag = cert.get('basis_diag', {'warnings': []})
+        basis_attack_detected = bool(basis_diag.get('basis_attack_detected', False))
         consistency_warning = self._cross_block_consistency_warning(
             h_min_certified, extraction_rate, session
         )
@@ -2205,6 +2221,7 @@ class TrustEnhancedQRNG:
             'epsilon_gate_drift_indicator': session.epsilon_gate_drift_indicator(),
             'epsilon_gate_moving_average': session.epsilon_gate_moving_average(),
             'weak_adversarial_influence_flag': weak_influence_flag,
+            'basis_attack_detected': basis_attack_detected,
         }
         return meta
 

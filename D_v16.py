@@ -1646,7 +1646,11 @@ class TrustEnhancedQRNG:
             'persistent_small_bias_flag': False,
         }
         if self.enable_gating and raw_signal is not None and len(raw_signal) == n_raw:
-            self.pre_value_gate.update_tau(self.trust_vector.epsilon_bias)
+            # Trust→entropy isolation:
+            # tau adaptation must not depend on trust diagnostics, otherwise trust
+            # would indirectly change accepted events and downstream entropy stats.
+            # Keep gate behavior deterministic and trust-independent here.
+            self.pre_value_gate.update_tau(0.0)
 
             # Selection-bias note:
             # Gating accepts only |signal| > tau samples, which can skew sample
@@ -1688,6 +1692,7 @@ class TrustEnhancedQRNG:
         )
         h_min_certified = cert['h_min_certified']
         # INVARIANT: h_min_certified is derived solely from p_max_upper.
+        basis_diag = self._basis_diagnostics(bases, n_test)
 
         # Step 3: Store f(eᵢ)·n_gen_i for EAT accumulation — via session
         # A5 FIX: was self.block_entropy_history.append(...), now session.append_block()
@@ -1704,6 +1709,76 @@ class TrustEnhancedQRNG:
             'n_test':          n_test,
             'cert':            cert,
             'h_min_certified': h_min_certified,
+            'basis_diag':      basis_diag,
+        }
+
+    def _basis_diagnostics(self,
+                           bases: Optional[np.ndarray],
+                           n_test: int) -> Dict[str, Union[bool, int, Optional[float], List[str]]]:
+        """
+        Basis diagnostics (metadata-only; never coupled to entropy/extraction).
+
+        Assumption note:
+        Current system assumes honest basis generation. Adversarial
+        basis-manipulation attacks are not fully mitigated in this release.
+        """
+        warnings: List[str] = []
+        zero_prob: Optional[float] = None
+        deviation: Optional[float] = None
+        anomaly_flag = False
+
+        if bases is None or len(bases) == 0:
+            unreliable = (n_test < self.min_n_test_required)
+            if unreliable:
+                warnings.append(
+                    f"n_test below configured minimum: {n_test} < {self.min_n_test_required}."
+                )
+            return {
+                'basis_zero_probability': zero_prob,
+                'basis_balance_deviation': deviation,
+                'basis_balance_tolerance': self.basis_balance_tolerance,
+                'basis_anomaly_flag': anomaly_flag,
+                'statistically_unreliable': unreliable,
+                'n_test_min_required': self.min_n_test_required,
+                'warnings': warnings,
+            }
+
+        b = np.asarray(bases, dtype=np.uint8).flatten()
+        zero_prob = float(np.mean(b == 0))
+        deviation = abs(zero_prob - 0.5)
+        if deviation > self.basis_balance_tolerance:
+            warnings.append(
+                f"basis imbalance detected: P(basis=0)={zero_prob:.4f}, "
+                f"deviation={deviation:.4f} > tolerance={self.basis_balance_tolerance:.4f}."
+            )
+            anomaly_flag = True
+
+        if len(b) >= 4:
+            # Structured-pattern heuristic (diagnostic only).
+            x = (2.0 * b.astype(np.float64)) - 1.0
+            lag1_corr = float(np.mean(x[1:] * x[:-1]))
+            alternation_rate = float(np.mean(b[1:] != b[:-1]))
+            if (abs(lag1_corr) > (1.0 - self.basis_pattern_threshold) or
+                    alternation_rate > (1.0 - 0.5 * self.basis_pattern_threshold)):
+                warnings.append(
+                    "basis anomaly heuristic triggered (structured pattern / high serial dependence)."
+                )
+                anomaly_flag = True
+
+        unreliable = (n_test < self.min_n_test_required)
+        if unreliable:
+            warnings.append(
+                f"n_test below configured minimum: {n_test} < {self.min_n_test_required}."
+            )
+
+        return {
+            'basis_zero_probability': zero_prob,
+            'basis_balance_deviation': deviation,
+            'basis_balance_tolerance': self.basis_balance_tolerance,
+            'basis_anomaly_flag': anomaly_flag,
+            'statistically_unreliable': unreliable,
+            'n_test_min_required': self.min_n_test_required,
+            'warnings': warnings,
         }
 
     def _run_diagnostics(self,
@@ -1721,6 +1796,7 @@ class TrustEnhancedQRNG:
         Returns:
             (trust_vector, diagnostic_warning, diagnostic_state)
         Pure diagnostic-layer logic — does not touch cert dict or entropy state.
+        Trust diagnostics are metadata-only and must never alter block inclusion.
         """
         trust_vector = self.run_self_tests(
             raw_bits, bases, raw_signal, signal_stats=signal_stats, epsilon_gate=epsilon_gate
@@ -1852,6 +1928,11 @@ class TrustEnhancedQRNG:
             h_min_certified, extraction_rate, session
         )
         merged_warning = diagnostic_warning
+        basis_warnings = basis_diag.get('warnings', [])
+        if basis_warnings:
+            basis_msg = " | ".join(str(w) for w in basis_warnings)
+            merged_warning = (f"{merged_warning} | {basis_msg}"
+                              if merged_warning else basis_msg)
         if consistency_warning is not None:
             merged_warning = (f"{diagnostic_warning} | {consistency_warning}"
                               if diagnostic_warning else consistency_warning)

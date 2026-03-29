@@ -222,6 +222,11 @@ class FinalDecision(TypedDict):
     accepted:       bool
     status:         Literal["ACCEPT", "WARN", "REJECT"]
     reason:         str
+    security_definition: str
+    epsilon_total:  float
+    epsilon_eat:    float
+    epsilon_smooth: float
+    epsilon_ext:    float
     certified_bits: int
     returned_bits:  int
 
@@ -646,10 +651,14 @@ class PreValueGate:
     def __init__(self,
                  sigma:         float = 1.0,
                  yield_min:     float = 0.30,
-                 tau_init:      float = 0.5):
+                 tau_init:      float = 0.5,
+                 max_epsilon_gate: float = 0.25,
+                 optimization_lambda: float = 0.5):
         self.sigma     = sigma
         self.yield_min = yield_min
         self.tau       = tau_init
+        self.max_epsilon_gate = float(max(max_epsilon_gate, 0.0))
+        self.optimization_lambda = float(np.clip(optimization_lambda, 0.0, 1.0))
 
         self._imr_grid = self._imr(self._TAU_SEARCH_GRID)
 
@@ -665,14 +674,24 @@ class PreValueGate:
 
         tau_grid   = self._TAU_SEARCH_GRID * self.sigma
         yield_grid = 2.0 * norm.sf(self._TAU_SEARCH_GRID)
+        imr_grid   = self._imr_grid
+        eps_bias   = float(np.clip(epsilon_bias, 0.0, 0.5))
+        eps_gate_est_grid = np.clip(eps_bias * imr_grid, 0.0, 0.5)
+        gate_constraint = eps_gate_est_grid <= self.max_epsilon_gate
 
-        valid = yield_grid >= self.yield_min
+        valid = (yield_grid >= self.yield_min) & gate_constraint
         if not np.any(valid):
             self.tau = tau_grid[0]
             return self.tau
 
-        imr_valid       = np.where(valid, self._imr_grid, np.inf)
-        best_idx        = int(np.argmin(imr_valid))
+        imr_norm = imr_grid / max(float(np.max(imr_grid)), 1e-12)
+        bias_norm = eps_gate_est_grid / max(self.max_epsilon_gate, 1e-12)
+        objective = (
+            self.optimization_lambda * imr_norm
+            + (1.0 - self.optimization_lambda) * bias_norm
+        )
+        objective_valid = np.where(valid, objective, np.inf)
+        best_idx = int(np.argmin(objective_valid))
         self.tau        = float(tau_grid[best_idx])
 
         return self.tau
@@ -773,16 +792,34 @@ class EntropyEstimator:
     Certifies min-entropy from observable BB84 statistics.
     """
 
-    def __init__(self, security_parameter: float = 1e-6):
-        # Composable security accounting:
+    def __init__(self,
+                 security_parameter: float = 1e-6,
+                 epsilon_eat: Optional[float] = None,
+                 epsilon_smooth: Optional[float] = None,
+                 epsilon_ext: Optional[float] = None):
+        # Composable security accounting (explicit, globally enforced):
         #   ε_total = ε_eat + ε_smooth + ε_ext
-        # Keep public API stable by interpreting security_parameter as the
-        # per-component budget. These three terms are independent components in
-        # composable proofs and must remain explicit throughout metadata.
-        self.epsilon_eat    = security_parameter
-        self.epsilon_smooth = security_parameter
-        self.epsilon_ext    = security_parameter
-        self.epsilon_total  = self.epsilon_eat + self.epsilon_smooth + self.epsilon_ext
+        eps_total = float(security_parameter)
+        if epsilon_eat is None and epsilon_smooth is None and epsilon_ext is None:
+            component = eps_total / 3.0
+            self.epsilon_eat = component
+            self.epsilon_smooth = component
+            self.epsilon_ext = component
+        else:
+            if None in (epsilon_eat, epsilon_smooth, epsilon_ext):
+                raise ValueError(
+                    "EntropyEstimator: provide all ε components or none."
+                )
+            self.epsilon_eat = float(cast(float, epsilon_eat))
+            self.epsilon_smooth = float(cast(float, epsilon_smooth))
+            self.epsilon_ext = float(cast(float, epsilon_ext))
+
+        self.epsilon_total = self.epsilon_eat + self.epsilon_smooth + self.epsilon_ext
+        if not np.isclose(self.epsilon_total, eps_total, rtol=0.0, atol=1e-18):
+            raise ValueError(
+                f"EntropyEstimator: ε_total mismatch. expected={eps_total:.3e}, "
+                f"got={self.epsilon_total:.3e}."
+            )
 
     def certify_min_entropy(self,
                             bits:  np.ndarray,
@@ -1062,6 +1099,7 @@ class QRNGSessionState:
     """
     block_entropy_history: List[float] = field(default_factory=list)
     block_n_gen_history:   List[int]   = field(default_factory=list)
+    block_gen_bits_history: List[np.ndarray] = field(default_factory=list)
     total_output_bits:     int         = 0
     total_gen_input_bits:  int         = 0
     total_raw_input_bits:  int         = 0
@@ -1105,7 +1143,10 @@ class QRNGSessionState:
 
         return max(sum_f - delta_eat, 0.0)
 
-    def append_block(self, h_min_certified: float, n_gen: int) -> None:
+    def append_block(self,
+                     h_min_certified: float,
+                     n_gen: int,
+                     gen_bits: Optional[np.ndarray] = None) -> None:
         """
         Record one block's contribution to the EAT accumulation.
 
@@ -1116,6 +1157,8 @@ class QRNGSessionState:
         self.block_entropy_history.append(h_min_certified * n_gen)
         self.block_n_gen_history.append(n_gen)
         self.block_h_min_history.append(h_min_certified)
+        if gen_bits is not None:
+            self.block_gen_bits_history.append(np.array(gen_bits, dtype=np.uint8, copy=True))
 
     def update_extraction_rate(self, extraction_rate: float) -> None:
         """Track per-block extraction rate for diagnostic consistency checks."""
@@ -1219,6 +1262,11 @@ class FinalDecisionLayer:
                 'reason': ("Trust score below halt threshold "
                            f"({trust_score:.4f} < {self.halt_threshold:.4f})"
                            + (f"; {' | '.join(reason_parts)}" if reason_parts else "")),
+                'security_definition': eat_summary['security_definition'],
+                'epsilon_total': float(eat_summary['epsilon_total']),
+                'epsilon_eat': float(eat_summary['epsilon_eat']),
+                'epsilon_smooth': float(eat_summary['epsilon_smooth']),
+                'epsilon_ext': float(eat_summary['epsilon_ext']),
                 'certified_bits': certified_bits,
                 'returned_bits': returned_bits,
             }
@@ -1230,6 +1278,11 @@ class FinalDecisionLayer:
                 'reason': ("Trust score below warn threshold "
                            f"({trust_score:.4f} < {self.warn_threshold:.4f})"
                            + (f"; {' | '.join(reason_parts)}" if reason_parts else "")),
+                'security_definition': eat_summary['security_definition'],
+                'epsilon_total': float(eat_summary['epsilon_total']),
+                'epsilon_eat': float(eat_summary['epsilon_eat']),
+                'epsilon_smooth': float(eat_summary['epsilon_smooth']),
+                'epsilon_ext': float(eat_summary['epsilon_ext']),
                 'certified_bits': certified_bits,
                 'returned_bits': returned_bits,
             }
@@ -1239,6 +1292,11 @@ class FinalDecisionLayer:
             'status': 'ACCEPT',
             'reason': ("Trust score within normal operating range"
                        + (f"; {' | '.join(reason_parts)}" if reason_parts else "")),
+            'security_definition': eat_summary['security_definition'],
+            'epsilon_total': float(eat_summary['epsilon_total']),
+            'epsilon_eat': float(eat_summary['epsilon_eat']),
+            'epsilon_smooth': float(eat_summary['epsilon_smooth']),
+            'epsilon_ext': float(eat_summary['epsilon_ext']),
             'certified_bits': certified_bits,
             'returned_bits': returned_bits,
         }
@@ -1284,7 +1342,30 @@ class CertifiedGenerationSession:
         """
         self.te_qrng     = te_qrng
         self.epsilon_eat = epsilon_eat
+        self.epsilon_smooth = te_qrng.epsilon_smooth
         self.epsilon_ext = epsilon_ext
+        self.epsilon_total = self.epsilon_eat + self.epsilon_smooth + self.epsilon_ext
+
+    @staticmethod
+    def _validate_epsilon_consistency(block_meta: BlockMetadata,
+                                      eat_summary: EATSummary,
+                                      final_decision: FinalDecision) -> None:
+        for label, record in (
+            ("BlockMetadata", block_meta),
+            ("EATSummary", eat_summary),
+            ("FinalDecision", final_decision),
+        ):
+            eps_total = float(record['epsilon_total'])
+            eps_sum = (
+                float(record['epsilon_eat'])
+                + float(record['epsilon_smooth'])
+                + float(record['epsilon_ext'])
+            )
+            if not np.isclose(eps_total, eps_sum, rtol=0.0, atol=1e-18):
+                raise RuntimeError(
+                    f"{label}: ε_total must equal ε_eat + ε_smooth + ε_ext "
+                    f"(got {eps_total:.3e} vs {eps_sum:.3e})."
+                )
 
     def run(self,
             n_bits:           int,
@@ -1334,14 +1415,20 @@ class CertifiedGenerationSession:
                 raw_bits, bases, raw_signal, session=session,
                 signal_stats=signal_stats
             )
+            if not np.isclose(
+                float(block_meta['epsilon_total']),
+                float(block_meta['epsilon_eat']) + float(block_meta['epsilon_smooth']) + float(block_meta['epsilon_ext']),
+                rtol=0.0, atol=1e-18
+            ):
+                raise RuntimeError("BlockMetadata ε accounting inconsistency.")
 
             metadata_list.append(block_meta)
 
-            if bases is not None:
-                gen_bits, _ = BB84RoundSplitter.split(raw_bits, bases)
-            else:
-                gen_bits = raw_bits
-            all_gen_bits.append(gen_bits)
+            if not session.block_gen_bits_history:
+                raise RuntimeError(
+                    "CertifiedGenerationSession.run: missing generation-bit history for block."
+                )
+            all_gen_bits.append(session.block_gen_bits_history[-1])
 
             h_total          = session.accumulate_eat(self.epsilon_eat)
             log2_inv_eps_ext = np.log2(1.0 / self.epsilon_ext)
@@ -1398,13 +1485,12 @@ class CertifiedGenerationSession:
 
         # Independent composable terms:
         #   ε_total = ε_eat + ε_smooth + ε_ext
-        epsilon_total = self.epsilon_eat + self.te_qrng.epsilon_smooth + self.epsilon_ext
         eat_summary: EATSummary = {
             'certified_quantity':    'H_min(X|E)',
             'security_definition':   'Trace-distance ε-security',
-            'epsilon_total':         epsilon_total,
+            'epsilon_total':         self.epsilon_total,
             'epsilon_eat':           self.epsilon_eat,
-            'epsilon_smooth':        self.te_qrng.epsilon_smooth,
+            'epsilon_smooth':        self.epsilon_smooth,
             'epsilon_ext':           self.epsilon_ext,
             'blocks_used':           t_blocks,
             'h_total_eat':           h_total,
@@ -1430,6 +1516,8 @@ class CertifiedGenerationSession:
             trust_score=last_block_meta['trust_score'] if last_block_meta else 1.0,
             epsilon_gate=last_block_meta.get('epsilon_gate', None) if last_block_meta else None,
         )
+        if last_block_meta is not None:
+            self._validate_epsilon_consistency(last_block_meta, eat_summary, final_decision)
         metadata_list.append(final_decision)
 
         # Enforce deterministic metadata ordering for downstream consumers:
@@ -1650,7 +1738,10 @@ class TrustEnhancedQRNG:
             # tau adaptation must not depend on trust diagnostics, otherwise trust
             # would indirectly change accepted events and downstream entropy stats.
             # Keep gate behavior deterministic and trust-independent here.
-            self.pre_value_gate.update_tau(0.0)
+            # τ must be chosen before processing this block, using only
+            # currently available block-local statistics (never future data).
+            pre_gate_bias = float(abs(np.mean(raw_bits) - 0.5)) if len(raw_bits) > 0 else 0.5
+            self.pre_value_gate.update_tau(pre_gate_bias)
 
             # Selection-bias note:
             # Gating accepts only |signal| > tau samples, which can skew sample
@@ -1692,11 +1783,11 @@ class TrustEnhancedQRNG:
         )
         h_min_certified = cert['h_min_certified']
         # INVARIANT: h_min_certified is derived solely from p_max_upper.
-        basis_diag = self._basis_diagnostics(bases, n_test)
+        basis_diag = self._basis_diagnostics(bases, n_gen, n_test)
 
         # Step 3: Store f(eᵢ)·n_gen_i for EAT accumulation — via session
         # A5 FIX: was self.block_entropy_history.append(...), now session.append_block()
-        session.append_block(h_min_certified, n_gen)
+        session.append_block(h_min_certified, n_gen, gen_bits=gen_bits)
 
         return {
             'raw_bits':        raw_bits,
@@ -1714,6 +1805,7 @@ class TrustEnhancedQRNG:
 
     def _basis_diagnostics(self,
                            bases: Optional[np.ndarray],
+                           n_gen: int,
                            n_test: int) -> Dict[str, Union[bool, int, Optional[float], List[str]]]:
         """
         Basis diagnostics (metadata-only; never coupled to entropy/extraction).
@@ -1742,6 +1834,19 @@ class TrustEnhancedQRNG:
                 'n_test_min_required': self.min_n_test_required,
                 'warnings': warnings,
             }
+
+        total = max(n_gen + n_test, 1)
+        gen_ratio = n_gen / total
+        test_ratio = n_test / total
+        min_ratio = 0.10
+        if gen_ratio < min_ratio:
+            warnings.append(
+                f"Generation/test imbalance warning: generation ratio={gen_ratio:.3f} < {min_ratio:.2f}."
+            )
+        if test_ratio < min_ratio:
+            warnings.append(
+                f"Generation/test imbalance warning: test ratio={test_ratio:.3f} < {min_ratio:.2f}."
+            )
 
         b = np.asarray(bases, dtype=np.uint8).flatten()
         zero_prob = float(np.mean(b == 0))
@@ -1924,6 +2029,7 @@ class TrustEnhancedQRNG:
         h_min_certified = cert['h_min_certified']
         output_length   = cert['output_length']
         extraction_rate = cert['extraction_rate']
+        basis_diag = cert.get('basis_diag', {'warnings': []})
         consistency_warning = self._cross_block_consistency_warning(
             h_min_certified, extraction_rate, session
         )
@@ -1967,7 +2073,7 @@ class TrustEnhancedQRNG:
         meta: BlockMetadata = {
             'certified_quantity':  'H_min(X|E)',
             'security_definition': 'Trace-distance ε-security',
-            'epsilon_total':       (self.epsilon_eat + self.epsilon_smooth + self.epsilon_ext),
+            'epsilon_total':       self.epsilon_total,
             'epsilon_eat':         self.epsilon_eat,
             'epsilon_smooth':      self.epsilon_smooth,
             'epsilon_ext':         self.epsilon_ext,
@@ -2118,6 +2224,7 @@ class TrustEnhancedQRNG:
             'output_length':   output_length,
             'extraction_rate': extraction_rate,
             'cert':            c['cert'],
+            'basis_diag':      c['basis_diag'],
         }
 
         # Layer 4 — Bookkeeping (updates session throughput counters)

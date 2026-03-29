@@ -82,7 +82,7 @@ v16 — Batch 7 fix: A5
 v14 — Batch 5 fix: A1
   A1. process_block() split into 4 private methods:
         _certify_block()    — Steps 0–3: gating, BB84 split, Hoeffding cert, EAT append
-        _run_diagnostics()  — Steps 4–5: run_self_tests, halt/warn decision
+        _run_diagnostics()  — Steps 4–5: run_self_tests, warning-only diagnostics
         _extract_block()    — Steps 6+8–9: LHL length, seed derivation, Toeplitz extraction
         _assemble_metadata()— Steps 7+10–11: 30-field metadata dict, throughput counters
       process_block() is now a ~25-line orchestrator that calls the four methods in order.
@@ -107,7 +107,7 @@ Security invariants (unchanged throughout all versions)
 import numpy as np
 from scipy import stats
 from dataclasses import dataclass, field
-from typing import Tuple, Dict, List, Optional, Union, Literal, cast
+from typing import Any, Tuple, Dict, List, Optional, Union, Literal, cast
 try:
     from typing import TypedDict
 except ImportError:          # Python < 3.8 fallback
@@ -161,12 +161,7 @@ class BlockMetadata(TypedDict):
     trust_score:           float
     trust_vector:          dict   # {epsilon_bias, epsilon_drift, epsilon_corr, epsilon_leak}
     diagnostic_warning:    Optional[str]
-    basis_zero_probability: Optional[float]
-    basis_balance_deviation: Optional[float]
-    basis_balance_tolerance: Optional[float]
-    statistically_unreliable: bool
-    n_test_min_required:   int
-    basis_anomaly_flag:    bool
+    diagnostic_state:      dict   # observational diagnostics (warnings/trends/anomalies)
     halt_threshold:        float
     warn_threshold:        float
     # ---- Throughput -------------------------------------------------------
@@ -177,9 +172,17 @@ class BlockMetadata(TypedDict):
     gate_tau:              Optional[float]
     gate_yield:            Optional[float]
     epsilon_gate:          Optional[float]
+    epsilon_gate_empirical: Optional[float]
+    epsilon_gate_bound:    Optional[float]
     gate_imr:              Optional[float]
+    gate_bias_acknowledged: bool
+    gate_entropy_correction_todo: bool
     gate_n_accepted:       int
     gate_n_total:          int
+    gate_min_accepted_threshold: int
+    gate_weak_statistics:  bool
+    gate_sample_warning:   Optional[str]
+    gate_persistent_small_bias_flag: bool
     cumulative_gate_yield: Optional[float]
     cumulative_epsilon_gate_trend: Optional[float]
 
@@ -233,8 +236,16 @@ class GateMetadata(TypedDict):
     n_accepted:   int
     yield_rate:   Optional[float]
     epsilon_gate: Optional[float]
+    epsilon_gate_empirical: Optional[float]
+    epsilon_gate_bound: Optional[float]
     imr:          Optional[float]
     sigma:        Optional[float]
+    bias_acknowledged: bool
+    entropy_correction_todo: bool
+    weak_statistics: bool
+    min_accepted_threshold: int
+    sample_warning: Optional[str]
+    persistent_small_bias_flag: bool
 
 
 # ---------------------------------------------------------------------------
@@ -287,18 +298,11 @@ class TrustVector:
 
 class DiagnosticHaltError(Exception):
     """
-    Raised when diagnostic self-tests detect a condition severe enough
-    to halt extraction entirely.
+    Legacy exception type retained for backward compatibility.
 
-    Diagnostics are ALLOWED to halt — they are FORBIDDEN to modify entropy.
-
-    Halt conditions (trust_score thresholds):
-        trust_score < HALT_THRESHOLD  → raise DiagnosticHaltError
-        trust_score < WARN_THRESHOLD  → add warning to metadata, continue
-
-    These thresholds are engineering policy, not security bounds.
-    The certified entropy H_cert remains valid regardless of trust_score;
-    halting is a conservative operational choice, not a cryptographic requirement.
+    NOTE (Batch-5 refactor):
+        Diagnostics are now warning-only and MUST NOT halt entropy generation.
+        This exception is no longer raised by the entropy pipeline.
     """
     HALT_THRESHOLD: float = 0.2   # Hard stop — system too unstable to operate
     WARN_THRESHOLD: float = 0.5   # Soft warning — degraded but operational
@@ -676,7 +680,10 @@ class PreValueGate:
     def apply(self,
               raw_signal: np.ndarray,
               bits:       np.ndarray,
-              bases:      np.ndarray
+              bases:      np.ndarray,
+              min_accepted_threshold: int = 100,
+              mu_attack: Optional[float] = None,
+              persistent_small_bias_flag: bool = False,
               ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, GateMetadata]:
         n_total     = len(raw_signal)
         gate_mask   = np.abs(raw_signal) > self.tau
@@ -688,14 +695,25 @@ class PreValueGate:
         n_accepted  = int(np.sum(gate_mask))
         yield_rate  = n_accepted / max(n_total, 1)
 
-        if n_accepted > 10:
-            epsilon_gate = float(abs(np.mean(accepted_bits) - 0.5))
+        # Post-selection note:
+        # The gate keeps only |raw_signal| > tau events. This can induce
+        # selection bias in the accepted stream; entropy formulas below still
+        # assume i.i.d. inputs and are intentionally left unchanged in Batch 3.
+        if n_accepted > 0:
+            epsilon_gate_empirical = float(abs(np.mean(accepted_bits) - 0.5))
         else:
-            epsilon_gate = 0.5
+            epsilon_gate_empirical = 0.5
 
         from scipy.stats import norm
         imr_val = float(norm.pdf(self.tau / self.sigma) /
                         max(norm.sf(self.tau / self.sigma), 1e-15))
+        mu_est = float(mu_attack) if mu_attack is not None else float(np.mean(raw_signal))
+        epsilon_gate_bound = float(abs(mu_est) * imr_val / 2.0)
+        weak_statistics = bool(n_accepted < max(int(min_accepted_threshold), 1))
+        sample_warning = (f"Gate accepted sample size is statistically weak: "
+                          f"n_accepted={n_accepted} < min_threshold={int(min_accepted_threshold)}.")
+        if not weak_statistics:
+            sample_warning = None
 
         gate_meta: GateMetadata = {
             'enabled':      True,
@@ -703,9 +721,17 @@ class PreValueGate:
             'n_total':      n_total,
             'n_accepted':   n_accepted,
             'yield_rate':   yield_rate,
-            'epsilon_gate': epsilon_gate,
+            'epsilon_gate': epsilon_gate_empirical,
+            'epsilon_gate_empirical': epsilon_gate_empirical,
+            'epsilon_gate_bound': epsilon_gate_bound,
             'imr':          imr_val,
             'sigma':        self.sigma,
+            'bias_acknowledged': True,
+            'entropy_correction_todo': True,
+            'weak_statistics': weak_statistics,
+            'min_accepted_threshold': int(min_accepted_threshold),
+            'sample_warning': sample_warning,
+            'persistent_small_bias_flag': bool(persistent_small_bias_flag),
         }
 
         return accepted_signal, accepted_bits, accepted_bases, gate_meta
@@ -1045,6 +1071,11 @@ class QRNGSessionState:
     gate_total_total:      int         = 0
     epsilon_gate_sum:      float       = 0.0
     epsilon_gate_count:    int         = 0
+    epsilon_gate_small_count: int      = 0
+    gate_block_count:      int         = 0
+    trust_score_history:   List[float] = field(default_factory=list)
+    session_warnings:      List[str]   = field(default_factory=list)
+    anomaly_history:       List[str]   = field(default_factory=list)
 
     def accumulate_eat(self, epsilon_eat: float) -> float:
         """
@@ -1093,7 +1124,8 @@ class QRNGSessionState:
     def update_gate_tracking(self,
                              n_accepted: int,
                              n_total: int,
-                             epsilon_gate: Optional[float]) -> None:
+                             epsilon_gate: Optional[float],
+                             small_bias_threshold: float = 0.01) -> None:
         """
         Track cumulative gate quantities.
 
@@ -1103,9 +1135,23 @@ class QRNGSessionState:
         """
         self.gate_accepted_total += int(n_accepted)
         self.gate_total_total += int(n_total)
+        self.gate_block_count += 1
         if epsilon_gate is not None:
             self.epsilon_gate_sum += float(epsilon_gate)
             self.epsilon_gate_count += 1
+            if float(epsilon_gate) <= float(small_bias_threshold):
+                self.epsilon_gate_small_count += 1
+
+    def record_diagnostics(self,
+                           trust_score: float,
+                           warning: Optional[str],
+                           anomalies: Optional[List[str]] = None) -> None:
+        """Record observational diagnostics without affecting entropy flow."""
+        self.trust_score_history.append(float(trust_score))
+        if warning:
+            self.session_warnings.append(str(warning))
+        if anomalies:
+            self.anomaly_history.extend([str(a) for a in anomalies if a])
 
     def cumulative_gate_yield(self) -> Optional[float]:
         if self.gate_total_total <= 0:
@@ -1116,6 +1162,19 @@ class QRNGSessionState:
         if self.epsilon_gate_count <= 0:
             return None
         return self.epsilon_gate_sum / self.epsilon_gate_count
+
+    def persistent_small_gate_bias_flag(self, min_blocks: int = 5,
+                                        min_ratio: float = 0.70) -> bool:
+        """
+        Flag persistent small gate bias regimes across blocks.
+
+        Small |mu_attack| can evade one-shot detection but still lower effective
+        entropy over time after post-selection.
+        """
+        if self.gate_block_count < max(int(min_blocks), 1):
+            return False
+        ratio = self.epsilon_gate_small_count / max(self.gate_block_count, 1)
+        return ratio >= float(min_ratio)
 
 
 # ---------------------------------------------------------------------------
@@ -1354,6 +1413,11 @@ class CertifiedGenerationSession:
             'delta_eat':             delta_eat,
             'sum_f_ei':              sum_f_ei,
         }
+        eat_summary['diagnostic_state'] = {
+            'trust_score_trend': session.trust_score_history,
+            'warnings': session.session_warnings,
+            'anomalies': session.anomaly_history,
+        }
 
         decision_layer = FinalDecisionLayer()
         last_block_meta = metadata_list[-1] if metadata_list else None
@@ -1436,16 +1500,16 @@ class TrustEnhancedQRNG:
                  enable_gating:        bool  = True,
                  sigma_signal:         float = 1.0,
                  yield_min:            float = 0.30,
-                 min_n_test_required:  int   = 100,
-                 basis_balance_tolerance: float = 0.10,
-                 basis_pattern_threshold: float = 0.15):
+                 gate_min_accepted_threshold: int = 100,
+                 gate_small_bias_epsilon: float = 0.01,
+                 gate_small_bias_window: int = 5):
         self.block_size           = block_size
         self.security_parameter   = security_parameter
         self.extractor_efficiency = extractor_efficiency
         self.enable_gating        = enable_gating
-        self.min_n_test_required  = int(min_n_test_required)
-        self.basis_balance_tolerance = float(basis_balance_tolerance)
-        self.basis_pattern_threshold = float(basis_pattern_threshold)
+        self.gate_min_accepted_threshold = max(int(gate_min_accepted_threshold), 1)
+        self.gate_small_bias_epsilon = float(gate_small_bias_epsilon)
+        self.gate_small_bias_window = max(int(gate_small_bias_window), 1)
 
         # Components
         self.stat_tester       = StatisticalSelfTester(window_size=block_size)
@@ -1570,8 +1634,16 @@ class TrustEnhancedQRNG:
             'n_accepted': n_raw,
             'yield_rate': None,
             'epsilon_gate': None,
+            'epsilon_gate_empirical': None,
+            'epsilon_gate_bound': None,
             'imr': None,
             'sigma': None,
+            'bias_acknowledged': False,
+            'entropy_correction_todo': False,
+            'weak_statistics': False,
+            'min_accepted_threshold': self.gate_min_accepted_threshold,
+            'sample_warning': None,
+            'persistent_small_bias_flag': False,
         }
         if self.enable_gating and raw_signal is not None and len(raw_signal) == n_raw:
             # Trust→entropy isolation:
@@ -1585,9 +1657,15 @@ class TrustEnhancedQRNG:
             # composition relative to the original stream. This bias is tracked
             # in metadata (gate_yield / epsilon_gate cumulants) but is not
             # corrected in entropy formulas at this stage.
+            persistent_small_bias_flag = session.persistent_small_gate_bias_flag(
+                min_blocks=self.gate_small_bias_window
+            )
             _, raw_bits, bases_gated, gate_meta = self.pre_value_gate.apply(
                 raw_signal, raw_bits,
-                bases if bases is not None else np.zeros(n_raw, dtype=np.uint8)
+                bases if bases is not None else np.zeros(n_raw, dtype=np.uint8),
+                min_accepted_threshold=self.gate_min_accepted_threshold,
+                mu_attack=None,
+                persistent_small_bias_flag=persistent_small_bias_flag,
             )
             if bases is not None:
                 bases      = bases_gated
@@ -1605,6 +1683,9 @@ class TrustEnhancedQRNG:
         n_test = len(test_bits)
 
         # Step 2: Phase-error certification — THE entropy bound (INVARIANT)
+        # TODO(Batch-Next): incorporate ε_gate correction into entropy bounds
+        # (Hoeffding/EAT/LHL chain) once a composable proof is integrated.
+        # For now, epsilon_gate_* fields remain diagnostics only.
         cert = self.entropy_estimator.certify_min_entropy(
             raw_bits,
             bases if bases is not None else np.zeros(n_raw, dtype=np.uint8)
@@ -1707,13 +1788,13 @@ class TrustEnhancedQRNG:
                          signal_stats: Optional[Tuple[float, float]],
                          h_min_certified: float,
                          epsilon_gate: Optional[float],
-                         ) -> Tuple[TrustVector, Optional[str]]:
+                         gate_meta: Optional[GateMetadata] = None,
+                         ) -> Tuple[TrustVector, Optional[str], Dict[str, Any]]:
         """
-        Steps 4–5: run_self_tests, then evaluate halt/warn thresholds.
+        Steps 4–5: run_self_tests, then evaluate diagnostic thresholds.
 
         Returns:
-            (trust_vector, diagnostic_warning)
-
+            (trust_vector, diagnostic_warning, diagnostic_state)
         Pure diagnostic-layer logic — does not touch cert dict or entropy state.
         Trust diagnostics are metadata-only and must never alter block inclusion.
         """
@@ -1723,26 +1804,51 @@ class TrustEnhancedQRNG:
         trust_score  = trust_vector.trust_score()
 
         diagnostic_warning: Optional[str] = None
+        anomalies: List[str] = []
         if trust_score < DiagnosticHaltError.HALT_THRESHOLD:
             diagnostic_warning = (
                 f"System instability detected: trust_score={trust_score:.4f} "
                 f"< HALT_THRESHOLD={DiagnosticHaltError.HALT_THRESHOLD}. "
-                f"h_min_certified={h_min_certified:.4f} is unaffected."
+                f"Entropy/extraction continue; h_min_certified={h_min_certified:.4f} is unaffected."
             )
-        if trust_score < DiagnosticHaltError.WARN_THRESHOLD:
-            warn_msg = (
+            anomalies.append("trust_score_below_halt_threshold")
+        elif trust_score < DiagnosticHaltError.WARN_THRESHOLD:
+            diagnostic_warning = (
                 f"Degraded operation: trust_score={trust_score:.4f} "
                 f"< WARN_THRESHOLD={DiagnosticHaltError.WARN_THRESHOLD}. "
                 f"h_min_certified={h_min_certified:.4f} is unaffected."
             )
-            diagnostic_warning = (f"{diagnostic_warning} | {warn_msg}"
-                                  if diagnostic_warning else warn_msg)
+            anomalies.append("trust_score_below_warn_threshold")
         if epsilon_gate is not None:
             gate_note = f"epsilon_gate={epsilon_gate:.6f} (selection-bias monitor only)"
             diagnostic_warning = (f"{diagnostic_warning} | {gate_note}"
                                   if diagnostic_warning else gate_note)
+        if gate_meta is not None:
+            if gate_meta.get('epsilon_gate_bound') is not None:
+                bound_note = (
+                    f"epsilon_gate_bound={gate_meta['epsilon_gate_bound']:.6f} "
+                    f"(diagnostic approximation; entropy correction TODO)"
+                )
+                diagnostic_warning = (f"{diagnostic_warning} | {bound_note}"
+                                      if diagnostic_warning else bound_note)
+            if gate_meta.get('sample_warning') is not None:
+                diagnostic_warning = (f"{diagnostic_warning} | {gate_meta['sample_warning']}"
+                                      if diagnostic_warning else gate_meta['sample_warning'])
+            if gate_meta.get('persistent_small_bias_flag', False):
+                small_bias_note = (
+                    "persistent small epsilon_gate trend detected; small mu_attack may evade "
+                    "single-block detection while still reducing effective entropy"
+                )
+                diagnostic_warning = (f"{diagnostic_warning} | {small_bias_note}"
+                                      if diagnostic_warning else small_bias_note)
+                anomalies.append("persistent_small_epsilon_gate_trend")
 
-        return trust_vector, diagnostic_warning
+        diagnostic_state = {
+            'trust_score': trust_score,
+            'warnings': [diagnostic_warning] if diagnostic_warning else [],
+            'anomalies': anomalies,
+        }
+        return trust_vector, diagnostic_warning, diagnostic_state
 
     def _extract_block(self,
                        gen_bits:      np.ndarray,
@@ -1796,7 +1902,7 @@ class TrustEnhancedQRNG:
                            gate_meta:         GateMetadata,
                            trust_vector:      TrustVector,
                            diagnostic_warning: Optional[str],
-                           basis_diag:        Dict[str, Union[bool, int, Optional[float], List[str]]],
+                           diagnostic_state:  Dict[str, Any],
                            output_bits_len:   int,
                            session:           QRNGSessionState,
                            ) -> BlockMetadata:
@@ -1828,8 +1934,11 @@ class TrustEnhancedQRNG:
             merged_warning = (f"{merged_warning} | {basis_msg}"
                               if merged_warning else basis_msg)
         if consistency_warning is not None:
-            merged_warning = (f"{merged_warning} | {consistency_warning}"
-                              if merged_warning else consistency_warning)
+            merged_warning = (f"{diagnostic_warning} | {consistency_warning}"
+                              if diagnostic_warning else consistency_warning)
+        if gate_meta.get('sample_warning') is not None:
+            merged_warning = (f"{merged_warning} | {gate_meta['sample_warning']}"
+                              if merged_warning else gate_meta['sample_warning'])
 
         # Update throughput counters in session (A5 FIX: was self.total_*)
         session.total_raw_input_bits  += n_raw
@@ -1840,6 +1949,12 @@ class TrustEnhancedQRNG:
             gate_meta['n_accepted'],
             gate_meta['n_total'],
             gate_meta['epsilon_gate'],
+            small_bias_threshold=self.gate_small_bias_epsilon,
+        )
+        session.record_diagnostics(
+            trust_score=trust_vector.trust_score(),
+            warning=merged_warning,
+            anomalies=diagnostic_state.get('anomalies', []),
         )
 
         # Compute EAT values from session state
@@ -1878,12 +1993,7 @@ class TrustEnhancedQRNG:
                 'epsilon_leak':  trust_vector.epsilon_leak,
             },
             'diagnostic_warning':  merged_warning,
-            'basis_zero_probability': basis_diag['basis_zero_probability'],
-            'basis_balance_deviation': basis_diag['basis_balance_deviation'],
-            'basis_balance_tolerance': basis_diag['basis_balance_tolerance'],
-            'statistically_unreliable': bool(basis_diag['statistically_unreliable']),
-            'n_test_min_required': int(basis_diag['n_test_min_required']),
-            'basis_anomaly_flag': bool(basis_diag['basis_anomaly_flag']),
+            'diagnostic_state':    diagnostic_state,
             'halt_threshold':      DiagnosticHaltError.HALT_THRESHOLD,
             'warn_threshold':      DiagnosticHaltError.WARN_THRESHOLD,
             'input_bits':          n_raw,
@@ -1893,9 +2003,17 @@ class TrustEnhancedQRNG:
             'gate_tau':          gate_meta['tau'],
             'gate_yield':        gate_meta['yield_rate'],
             'epsilon_gate':      gate_meta['epsilon_gate'],
+            'epsilon_gate_empirical': gate_meta['epsilon_gate_empirical'],
+            'epsilon_gate_bound': gate_meta['epsilon_gate_bound'],
             'gate_imr':          gate_meta['imr'],
+            'gate_bias_acknowledged': gate_meta['bias_acknowledged'],
+            'gate_entropy_correction_todo': gate_meta['entropy_correction_todo'],
             'gate_n_accepted':   gate_meta['n_accepted'],
             'gate_n_total':      gate_meta['n_total'],
+            'gate_min_accepted_threshold': gate_meta['min_accepted_threshold'],
+            'gate_weak_statistics': gate_meta['weak_statistics'],
+            'gate_sample_warning': gate_meta['sample_warning'],
+            'gate_persistent_small_bias_flag': gate_meta['persistent_small_bias_flag'],
             # Selection-bias monitoring only (diagnostic, no entropy coupling):
             'cumulative_gate_yield': session.cumulative_gate_yield(),
             'cumulative_epsilon_gate_trend': session.cumulative_epsilon_gate_trend(),
@@ -1974,10 +2092,11 @@ class TrustEnhancedQRNG:
         # Layer 1 — Certified layer
         c = self._certify_block(raw_bits, bases, raw_signal, n_raw, session)
 
-        # Layer 2 — Diagnostic layer (warning-only; no entropy coupling)
-        trust_vector, diagnostic_warning = self._run_diagnostics(
+        # Layer 2 — Diagnostic layer (warning-only; never halts entropy flow)
+        trust_vector, diagnostic_warning, diagnostic_state = self._run_diagnostics(
             c['raw_bits'], c['bases'], c['raw_signal'],
             signal_stats, c['h_min_certified'], c['gate_meta']['epsilon_gate'],
+            gate_meta=c['gate_meta'],
         )
 
         # Compute extraction_rate for metadata
@@ -2004,7 +2123,7 @@ class TrustEnhancedQRNG:
         # Layer 4 — Bookkeeping (updates session throughput counters)
         meta = self._assemble_metadata(
             cert_bundle, c['n_raw'], c['gate_meta'],
-            trust_vector, diagnostic_warning, c['basis_diag'], len(output_bits),
+            trust_vector, diagnostic_warning, diagnostic_state, len(output_bits),
             session,
         )
 

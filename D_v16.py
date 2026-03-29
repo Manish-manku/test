@@ -1311,27 +1311,18 @@ class CertifiedGenerationSession:
             'sum_f_ei':              sum_f_ei,
         }
 
-        last_block_meta: Optional[BlockMetadata] = None
-        if len(metadata_list) > 0:
-            possible_block_meta = metadata_list[-1]
-            if 'trust_score' in possible_block_meta:
-                last_block_meta = cast(BlockMetadata, possible_block_meta)
-
-        trust_score = (last_block_meta['trust_score']
-                       if last_block_meta is not None else 1.0)
-        epsilon_gate = (last_block_meta['epsilon_gate']
-                        if last_block_meta is not None else None)
-
         decision_layer = FinalDecisionLayer()
+
         final_decision = decision_layer.evaluate(
-            final_bits=final_bits[:n_bits],
+            final_bits=final_bits,
             eat_summary=eat_summary,
-            last_block_meta=last_block_meta,
-            trust_score=trust_score,
-            epsilon_gate=epsilon_gate,
+            last_block_meta=metadata_list[-1] if metadata_list else None,
+            trust_score=metadata_list[-1]['trust_score'] if metadata_list else 1.0,
+            epsilon_gate=metadata_list[-1].get('epsilon_gate', None) if metadata_list else None,
         )
-        metadata_list.append(final_decision)
+
         metadata_list.append(eat_summary)
+        metadata_list.append(final_decision)
 
         return final_bits[:n_bits], metadata_list
 
@@ -1432,7 +1423,8 @@ class TrustEnhancedQRNG:
                        raw_bits:    np.ndarray,
                        bases:       Optional[np.ndarray] = None,
                        raw_signal:  Optional[np.ndarray] = None,
-                       signal_stats: Optional[Tuple[float, float]] = None) -> TrustVector:
+                       signal_stats: Optional[Tuple[float, float]] = None,
+                       epsilon_gate: Optional[float] = None) -> TrustVector:
         """
         Run the full statistical / quantum self-test suite.
 
@@ -1479,6 +1471,9 @@ class TrustEnhancedQRNG:
             self.drift_monitor.update_efficiency(float(np.mean(raw_bits)))
             _, drift_score = self.drift_monitor.detect_drift()
             epsilon_drift = _sigmoid(drift_score, k=4.0, x0=1.0)  # heuristic
+
+        if epsilon_gate is not None:
+            epsilon_bias = max(epsilon_bias, epsilon_gate)
 
         self.trust_vector = TrustVector(
             epsilon_bias  = float(np.clip(epsilon_bias,  0.0, 1.0)),
@@ -1571,6 +1566,7 @@ class TrustEnhancedQRNG:
                          raw_signal:   Optional[np.ndarray],
                          signal_stats: Optional[Tuple[float, float]],
                          h_min_certified: float,
+                         epsilon_gate: Optional[float],
                          ) -> Tuple[TrustVector, Optional[str]]:
         """
         Steps 4–5: run_self_tests, then evaluate halt/warn thresholds.
@@ -1581,7 +1577,9 @@ class TrustEnhancedQRNG:
         Raises DiagnosticHaltError when trust_score < HALT_THRESHOLD.
         Pure diagnostic-layer logic — does not touch cert dict or entropy state.
         """
-        trust_vector = self.run_self_tests(raw_bits, bases, raw_signal, signal_stats=signal_stats)
+        trust_vector = self.run_self_tests(
+            raw_bits, bases, raw_signal, signal_stats=signal_stats, epsilon_gate=epsilon_gate
+        )
         trust_score  = trust_vector.trust_score()
 
         diagnostic_warning: Optional[str] = None
@@ -1765,7 +1763,7 @@ class TrustEnhancedQRNG:
         # Layer 2 — Diagnostic layer (may raise DiagnosticHaltError)
         trust_vector, diagnostic_warning = self._run_diagnostics(
             c['raw_bits'], c['bases'], c['raw_signal'],
-            signal_stats, c['h_min_certified'],
+            signal_stats, c['h_min_certified'], c['gate_meta']['epsilon_gate'],
         )
 
         # Compute extraction_rate for metadata

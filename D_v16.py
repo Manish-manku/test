@@ -719,6 +719,7 @@ class PreValueGate:
               persistent_small_bias_flag: bool = False,
               ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, GateMetadata]:
         n_total     = len(raw_signal)
+        pre_gate_mean = float(np.mean(raw_signal)) if n_total > 0 else 0.0
         gate_mask   = np.abs(raw_signal) > self.tau
 
         accepted_signal = raw_signal[gate_mask]
@@ -740,7 +741,11 @@ class PreValueGate:
         from scipy.stats import norm
         imr_val = float(norm.pdf(self.tau / self.sigma) /
                         max(norm.sf(self.tau / self.sigma), 1e-15))
-        mu_est = float(mu_attack) if mu_attack is not None else float(np.mean(raw_signal))
+        mu_est = float(mu_attack) if mu_attack is not None else pre_gate_mean
+        # If upstream already supplied a gated stream (all |x| > tau), estimate
+        # the latent Gaussian mean with a truncated-normal correction.
+        if mu_attack is None and n_total > 0 and np.all(np.abs(raw_signal) > self.tau):
+            mu_est = self._estimate_mu_from_truncated_gaussian(raw_signal)
         epsilon_gate_bound = float(abs(mu_est) * imr_val / 2.0)
         weak_statistics = bool(n_accepted < max(int(min_accepted_threshold), 1))
         sample_warning = (f"Gate accepted sample size is statistically weak: "
@@ -768,6 +773,41 @@ class PreValueGate:
         }
 
         return accepted_signal, accepted_bits, accepted_bases, gate_meta
+
+    def _estimate_mu_from_truncated_gaussian(self,
+                                             observed_signal: np.ndarray,
+                                             max_iter: int = 25) -> float:
+        """
+        Estimate latent μ for X~N(μ,σ²) from samples conditioned on |X| > τ.
+        """
+        from scipy.stats import norm
+
+        y = np.asarray(observed_signal, dtype=np.float64).flatten()
+        if y.size == 0:
+            return 0.0
+
+        tau = float(self.tau)
+        sigma = max(float(self.sigma), 1e-12)
+        target_mean = float(np.mean(y))
+
+        def trunc_mean(mu: float) -> float:
+            alpha = (tau - mu) / sigma
+            beta = (-tau - mu) / sigma
+            z = max(float(norm.sf(alpha) + norm.cdf(beta)), 1e-15)
+            return float(mu + sigma * (norm.pdf(alpha) - norm.pdf(beta)) / z)
+
+        mu = float(np.clip(target_mean, -8.0 * sigma, 8.0 * sigma))
+        for _ in range(max_iter):
+            f_val = trunc_mean(mu) - target_mean
+            if abs(f_val) < 1e-12:
+                break
+            h = max(1e-6 * sigma, 1e-9)
+            derivative = (trunc_mean(mu + h) - trunc_mean(mu - h)) / (2.0 * h)
+            if abs(derivative) < 1e-12:
+                break
+            mu -= f_val / derivative
+            mu = float(np.clip(mu, -8.0 * sigma, 8.0 * sigma))
+        return mu
 
     def epsilon_gate_bound(self, mu_attack: float) -> float:
         from scipy.stats import norm
@@ -837,7 +877,8 @@ class EntropyEstimator:
 
     def certify_min_entropy(self,
                             bits:  np.ndarray,
-                            bases: np.ndarray) -> Dict:
+                            bases: np.ndarray,
+                            epsilon_gate_empirical: Optional[float] = None) -> Dict:
         # F10 FIX: validate inputs before use.
         bits  = np.asarray(bits,  dtype=np.uint8).flatten()
         bases = np.asarray(bases, dtype=np.uint8).flatten()
@@ -866,8 +907,11 @@ class EntropyEstimator:
 
         delta            = np.sqrt(np.log(1.0 / self.epsilon_smooth) / (2.0 * n_test))
         p_max_upper      = min(p_max_hat + delta, 1.0)
+        eps_gate = float(np.clip(epsilon_gate_empirical, 0.0, 0.5)) \
+            if epsilon_gate_empirical is not None else 0.0
+        p_max_upper_postselect = min(p_max_upper + eps_gate, 1.0)
 
-        h_min_certified  = max(-np.log2(p_max_upper), 0.0)
+        h_min_certified  = max(-np.log2(p_max_upper_postselect), 0.0)
 
         return {
             'n_generation':    n_gen,
@@ -876,6 +920,8 @@ class EntropyEstimator:
             'p_max_hat':       p_max_hat,
             'delta':           delta,
             'p_max_upper':     p_max_upper,
+            'epsilon_gate_empirical': eps_gate,
+            'p_max_upper_postselect': p_max_upper_postselect,
             'h_min_certified': h_min_certified,
         }
 
@@ -894,6 +940,8 @@ class EntropyEstimator:
         return {'n_generation': n_gen, 'n_test': n_test,
                 'p_hat': 1.0, 'p_max_hat': 1.0,
                 'delta': 0.0, 'p_max_upper': 1.0,
+                'epsilon_gate_empirical': 0.0,
+                'p_max_upper_postselect': 1.0,
                 'h_min_certified': 0.0}
 
 
@@ -925,8 +973,8 @@ class RandomnessExtractor:
         if len(seed) < required:
             seed = self._extend_seed(seed, required)
 
-        col      = seed[:m].astype(np.float32)
-        row_tail = seed[1:n].astype(np.float32)
+        col      = seed[:m].astype(np.float64)
+        row_tail = seed[1:n].astype(np.float64)
 
         raw_size  = m + n
         circ_size = 1 << int(np.ceil(np.log2(max(raw_size, 2))))
@@ -937,13 +985,13 @@ class RandomnessExtractor:
                 "Use smaller chunks or reduce output_length."
             )
 
-        circ_col = np.zeros(circ_size, dtype=np.float32)
+        circ_col = np.zeros(circ_size, dtype=np.float64)
         circ_col[:m] = col
         if len(row_tail) > 0:
             circ_col[circ_size - len(row_tail):] = row_tail[::-1]
 
-        x_pad = np.zeros(circ_size, dtype=np.float32)
-        x_pad[:n] = weak_random.astype(np.float32)
+        x_pad = np.zeros(circ_size, dtype=np.float64)
+        x_pad[:n] = weak_random.astype(np.float64)
 
         try:
             y_full = np.fft.irfft(
@@ -956,7 +1004,7 @@ class RandomnessExtractor:
                 "Reduce block_size or max_workers."
             )
 
-        output = np.round(y_full[:m]).astype(np.int64) % 2
+        output = np.rint(y_full[:m]).astype(np.int64) % 2
         return output.astype(np.uint8)
 
     def toeplitz_extract(self, weak_random: np.ndarray,
@@ -1853,13 +1901,12 @@ class TrustEnhancedQRNG:
         n_gen  = len(gen_bits)
         n_test = len(test_bits)
 
-        # Step 2: Phase-error certification — THE entropy bound (INVARIANT)
-        # TODO(Batch-Next): incorporate ε_gate correction into entropy bounds
-        # (Hoeffding/EAT/LHL chain) once a composable proof is integrated.
-        # For now, epsilon_gate_* fields remain diagnostics only.
+        # Step 2: Phase-error certification — includes post-selection
+        # correction from empirical gate bias ε_gate.
         cert = self.entropy_estimator.certify_min_entropy(
             raw_bits,
-            bases if bases is not None else np.zeros(n_raw, dtype=np.uint8)
+            bases if bases is not None else np.zeros(n_raw, dtype=np.uint8),
+            epsilon_gate_empirical=gate_meta.get('epsilon_gate_empirical')
         )
         h_min_certified = cert['h_min_certified']
         # INVARIANT: h_min_certified is derived solely from p_max_upper.
